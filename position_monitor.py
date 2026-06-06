@@ -1,0 +1,166 @@
+"""
+Position Monitor — trailing stop for all open Hyperliquid positions.
+
+Runs as a background thread. Every MONITOR_INTERVAL_SECONDS it fetches
+all open positions and checks whether the current price has pulled back
+more than TRAILING_STOP_PCT from the best price seen since the position
+was detected.
+
+For longs:  tracks the highest price reached. Closes if price drops
+            TRAILING_STOP_PCT below that peak.
+
+For shorts: tracks the lowest price reached. Closes if price rises
+            TRAILING_STOP_PCT above that trough.
+
+Once a position is closed the bot returns to idle — the signal tracker
+waits for the next buy/sell signal as normal.
+
+Set TRAILING_STOP_PCT=0 in .env to disable.
+"""
+
+import os
+import time
+import logging
+import threading
+
+logger = logging.getLogger(__name__)
+
+
+class PositionMonitor:
+    def __init__(self, trader, notifier, cooldown_until: dict = None, cooldown_seconds: int = 0):
+        self.trader    = trader
+        self.notifier  = notifier
+        self.trail_pct = float(os.environ.get("TRAILING_STOP_PCT", "0.05"))
+        self.interval  = int(os.environ.get("MONITOR_INTERVAL_SECONDS", "30"))
+
+        # best[(coin, side)] = best price seen since position first detected
+        #   long  → highest price (stop fires if price drops trail_pct below this)
+        #   short → lowest price  (stop fires if price rises trail_pct above this)
+        self._best: dict        = {}
+        self._cooldown_until    = cooldown_until  # shared ref from signal_tracker
+        self._cooldown_seconds  = cooldown_seconds
+        # Tracks coins currently being closed to prevent double-close race condition
+        self._closing: set = set()
+        self._stop         = threading.Event()
+
+    def start(self):
+        if self.trail_pct <= 0:
+            logger.info("Trailing stop disabled (TRAILING_STOP_PCT=0)")
+            return
+        logger.info(
+            f"Position monitor started | "
+            f"trailing stop={self.trail_pct * 100:.1f}% | "
+            f"check every {self.interval}s"
+        )
+        t = threading.Thread(target=self._run, daemon=True)
+        t.start()
+
+    def _run(self):
+        while not self._stop.wait(self.interval):
+            try:
+                self._check_all()
+            except Exception as e:
+                logger.error(f"Monitor error: {e}")
+
+    def _check_all(self):
+        try:
+            positions = self.trader.get_positions()
+        except Exception as e:
+            logger.error(f"Monitor: failed to fetch positions (will retry next cycle): {e}")
+            return
+        active_keys = set()
+
+        for pos in positions:
+            coin = pos["coin"]
+            side = pos["side"]
+            key  = (coin, side)
+            active_keys.add(key)
+
+            # Skip if a close is already in flight for this position
+            if key in self._closing:
+                continue
+
+            try:
+                price = self.trader.get_price(coin)
+            except Exception as e:
+                logger.warning(f"[{coin}] Could not fetch price: {e}")
+                continue
+
+            # First time we see this position — initialise best price
+            if key not in self._best:
+                self._best[key] = price
+                stop_ref = (
+                    price * (1 - self.trail_pct) if side == "long"
+                    else price * (1 + self.trail_pct)
+                )
+                logger.info(
+                    f"[{coin}] {side.upper()} detected — "
+                    f"trailing stop initialised | ref={price:.4f} | "
+                    f"stop triggers {'below' if side == 'long' else 'above'} {stop_ref:.4f}"
+                )
+                continue
+
+            if side == "long":
+                if price > self._best[key]:
+                    self._best[key] = price
+                    logger.debug(f"[{coin}] Long peak → {price:.4f}")
+                stop_px = self._best[key] * (1 - self.trail_pct)
+                if price <= stop_px:
+                    self._trigger(coin, side, price, self._best[key], stop_px)
+
+            elif side == "short":
+                if price < self._best[key]:
+                    self._best[key] = price
+                    logger.debug(f"[{coin}] Short trough → {price:.4f}")
+                stop_px = self._best[key] * (1 + self.trail_pct)
+                if price >= stop_px:
+                    self._trigger(coin, side, price, self._best[key], stop_px)
+
+        # Clean up tracking for positions that no longer exist
+        for key in list(self._best.keys()):
+            if key not in active_keys and key not in self._closing:
+                logger.info(f"[{key[0]}] {key[1]} position gone — removing from monitor")
+                del self._best[key]
+
+    def _trigger(self, coin: str, side: str, price: float, best: float, stop_px: float):
+        key = (coin, side)
+
+        # Guard against double-close if two checks overlap
+        if key in self._closing:
+            logger.debug(f"[{coin}] Close already in progress for {side} — skipping")
+            return
+        self._closing.add(key)
+
+        pct_move = abs(price - best) / best * 100
+        logger.warning(
+            f"[{coin}] Trailing stop hit | side={side} | "
+            f"price={price:.4f} | best={best:.4f} | "
+            f"stop={stop_px:.4f} | pullback={pct_move:.1f}%"
+        )
+        self.notifier.send(
+            f"🛑 [{coin}] Trailing stop hit — closing {side}\n"
+            f"Price: {price:.4f} | Best: {best:.4f} | "
+            f"Pulled back {pct_move:.1f}%"
+        )
+
+        try:
+            if side == "long":
+                result = self.trader.close_long(coin)
+            else:
+                result = self.trader.close_short(coin)
+
+            logger.info(f"[{coin}] Trailing stop closed {side}: {result}")
+            if self._cooldown_until is not None and self._cooldown_seconds > 0:
+                self._cooldown_until[coin] = time.time() + self._cooldown_seconds
+                logger.info(f"[{coin}] Cooldown set for {self._cooldown_seconds}s after trailing stop close")
+            self.notifier.send(
+                f"✅ [{coin}] {side.capitalize()} closed — back to idle\n"
+                f"Result: {result}"
+            )
+        except Exception as e:
+            logger.error(f"[{coin}] Failed to close {side} on trailing stop: {e}")
+            self.notifier.send(f"⚠️ [{coin}] Trailing stop FAILED to close {side}: {e}")
+        finally:
+            # Always clean up so we don't retry on the next check
+            self._best.pop(key, None)
+            self._closing.discard(key)

@@ -1,0 +1,315 @@
+"""
+PTOS Signal Tracker — Hyperliquid Edition (2-step, multi-signal)
+Listens for TradingView webhooks and executes perp trades on Hyperliquid.
+
+BUY flow:
+  POST /buy-signal   Arm (or refresh) the buy watch. Can fire multiple times.
+  POST /trend-up     Trend confirmed up → open long (only if buy is armed)
+
+SELL flow:
+  POST /sell-signal  Arm (or refresh) the sell watch. Can fire multiple times.
+  POST /trend-down   Trend confirmed down → close long / open short (only if sell is armed)
+
+Buy and sell are tracked independently per coin — a sell signal won't cancel
+a pending buy, and vice versa.
+
+  GET  /status       Current armed state per coin
+  GET  /positions    Live Hyperliquid positions
+  GET  /health       Health check
+"""
+
+import os
+import sys
+import time
+import logging
+import threading
+from flask import Flask, request, jsonify
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+from hyperliquid_trader import HyperliquidTrader
+from telegram_notify import TelegramNotifier
+from position_monitor import PositionMonitor
+
+# ── Config ────────────────────────────────────────────────────────────────────
+SECRET_TOKEN   = os.environ.get("SECRET_TOKEN", "")
+WINDOW_SECONDS = int(os.environ.get("WINDOW_SECONDS", 144000))
+SELL_MODE      = os.environ.get("SELL_MODE", "short")   # "short" | "close_long" | "open_short"
+SELL_PCT       = float(os.environ.get("SELL_PCT", "1.0"))
+
+# ── Startup validation ────────────────────────────────────────────────────────
+if SELL_MODE not in ("short", "close_long", "open_short"):
+    print(f"ERROR: Invalid SELL_MODE '{SELL_MODE}'. Must be: short, close_long, open_short", flush=True)
+    sys.exit(1)
+
+if not SECRET_TOKEN:
+    print("WARNING: SECRET_TOKEN is not set — all webhook endpoints are unprotected", flush=True)
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+# ── App + rate limiter ────────────────────────────────────────────────────────
+app     = Flask(__name__)
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=["60 per minute"],
+    storage_uri="memory://",
+)
+
+# ── Core services (module-level so Gunicorn picks them up) ───────────────────
+trader   = HyperliquidTrader()
+notifier = TelegramNotifier()
+lock     = threading.Lock()
+
+# ── State ─────────────────────────────────────────────────────────────────────
+# armed[coin]["buy"]  = timestamp of last buy-signal  (or None)
+# armed[coin]["sell"] = timestamp of last sell-signal (or None)
+armed: dict = {}
+
+# cooldown_until[coin] = timestamp before which no new trade executes
+# Set after any trade close to prevent immediate re-entry
+COOLDOWN_SECONDS  = int(os.environ.get("COOLDOWN_SECONDS", "0"))
+cooldown_until: dict = {}
+
+# Start trailing stop monitor at module level — works with Gunicorn single worker
+monitor = PositionMonitor(trader, notifier, cooldown_until=cooldown_until, cooldown_seconds=COOLDOWN_SECONDS)
+monitor.start()
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def normalize_coin(raw: str) -> str:
+    """Strip exchange suffixes: 'SOL/USD' → 'SOL'."""
+    coin = raw.upper().strip()
+    for suffix in [
+        "/USD", "/USDC", "/USDT", "/BUSD", "/PERP",
+        "-USD", "-USDC", "-USDT", "-PERP",
+        ".P",   # some TV symbols
+    ]:
+        if coin.endswith(suffix):
+            coin = coin[: -len(suffix)]
+            break
+    return coin
+
+
+def verify_token(data: dict) -> bool:
+    if not SECRET_TOKEN:
+        return True
+    return data.get("token") == SECRET_TOKEN
+
+
+def _is_armed(coin: str, side: str) -> bool:
+    ts = armed.get(coin, {}).get(side)
+    if ts is None:
+        return False
+    return time.time() - ts <= WINDOW_SECONDS
+
+
+def _arm(coin: str, side: str) -> bool:
+    """Arm or refresh. Returns True if this is a refresh."""
+    if coin not in armed:
+        armed[coin] = {"buy": None, "sell": None}
+    was_armed = _is_armed(coin, side)
+    armed[coin][side] = time.time()
+    return was_armed
+
+
+def _disarm(coin: str, side: str):
+    if coin in armed:
+        armed[coin][side] = None
+
+
+def _window_remaining(coin: str, side: str) -> int:
+    ts = armed.get(coin, {}).get(side)
+    if ts is None:
+        return 0
+    return max(0, int(WINDOW_SECONDS - (time.time() - ts)))
+
+
+# ── BUY flow ──────────────────────────────────────────────────────────────────
+
+@app.route("/buy-signal", methods=["POST"])
+@limiter.limit("30 per minute")
+def buy_signal():
+    data = request.get_json(silent=True) or {}
+    if not verify_token(data):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    coin = normalize_coin(data.get("coin") or data.get("pair", "SOL"))
+    with lock:
+        refreshed = _arm(coin, "buy")
+
+    if refreshed:
+        logger.info(f"[{coin}] BUY signal refreshed — still waiting for trend-up")
+        notifier.send(f"🔄 [{coin}] BUY signal refreshed — still waiting for trend turn up")
+    else:
+        logger.info(f"[{coin}] BUY signal armed — waiting for trend-up")
+        notifier.send(f"📊 [{coin}] BUY signal armed — waiting for trend turn up")
+
+    return jsonify({
+        "status":             "refreshed" if refreshed else "armed",
+        "coin":               coin,
+        "next":               "/trend-up",
+        "window_remaining_s": _window_remaining(coin, "buy"),
+    })
+
+
+@app.route("/trend-up", methods=["POST"])
+@limiter.limit("30 per minute")
+def trend_up():
+    data = request.get_json(silent=True) or {}
+    if not verify_token(data):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    coin = normalize_coin(data.get("coin") or data.get("pair", "SOL"))
+    with lock:
+        if not _is_armed(coin, "buy"):
+            logger.info(f"[{coin}] trend-up ignored — no active buy signal")
+            return jsonify({"status": "skip", "message": f"No active buy signal for {coin}"}), 200
+        _disarm(coin, "buy")
+
+    if COOLDOWN_SECONDS > 0 and time.time() < cooldown_until.get(coin, 0):
+        remaining = int(cooldown_until[coin] - time.time())
+        logger.info(f"[{coin}] Trend-up ignored — cooldown active ({remaining}s remaining)")
+        notifier.send(f"⏳ [{coin}] Trend-up ignored — cooldown active ({remaining}s remaining)")
+        return jsonify({"status": "cooldown", "coin": coin, "cooldown_remaining_s": remaining}), 200
+
+    logger.info(f"[{coin}] Trend UP confirmed — executing LONG")
+    notifier.send(f"🟢 [{coin}] Trend up! Opening LONG on Hyperliquid...")
+    result = trader.open_long(coin)
+    if COOLDOWN_SECONDS > 0:
+        cooldown_until[coin] = time.time() + COOLDOWN_SECONDS
+    notifier.send(f"✅ [{coin}] Long opened: {result}")
+    return jsonify({"status": "trade_executed", "action": "open_long", "coin": coin, "result": result})
+
+
+# ── SELL flow ─────────────────────────────────────────────────────────────────
+
+@app.route("/sell-signal", methods=["POST"])
+@limiter.limit("30 per minute")
+def sell_signal():
+    data = request.get_json(silent=True) or {}
+    if not verify_token(data):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    coin = normalize_coin(data.get("coin") or data.get("pair", "SOL"))
+    with lock:
+        refreshed = _arm(coin, "sell")
+
+    if refreshed:
+        logger.info(f"[{coin}] SELL signal refreshed — still waiting for trend-down")
+        notifier.send(f"🔄 [{coin}] SELL signal refreshed — still waiting for trend turn down")
+    else:
+        logger.info(f"[{coin}] SELL signal armed — waiting for trend-down")
+        notifier.send(f"📊 [{coin}] SELL signal armed — waiting for trend turn down")
+
+    return jsonify({
+        "status":             "refreshed" if refreshed else "armed",
+        "coin":               coin,
+        "next":               "/trend-down",
+        "window_remaining_s": _window_remaining(coin, "sell"),
+    })
+
+
+@app.route("/trend-down", methods=["POST"])
+@limiter.limit("30 per minute")
+def trend_down():
+    data = request.get_json(silent=True) or {}
+    if not verify_token(data):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    coin = normalize_coin(data.get("coin") or data.get("pair", "SOL"))
+    with lock:
+        if not _is_armed(coin, "sell"):
+            logger.info(f"[{coin}] trend-down ignored — no active sell signal")
+            return jsonify({"status": "skip", "message": f"No active sell signal for {coin}"}), 200
+        _disarm(coin, "sell")
+
+    if COOLDOWN_SECONDS > 0 and time.time() < cooldown_until.get(coin, 0):
+        remaining = int(cooldown_until[coin] - time.time())
+        logger.info(f"[{coin}] Trend-down ignored — cooldown active ({remaining}s remaining)")
+        notifier.send(f"⏳ [{coin}] Trend-down ignored — cooldown active ({remaining}s remaining)")
+        return jsonify({"status": "cooldown", "coin": coin, "cooldown_remaining_s": remaining}), 200
+
+    if SELL_MODE == "short":
+        logger.info(f"[{coin}] Trend DOWN confirmed — flipping to SHORT")
+        notifier.send(f"🔴 [{coin}] Trend down! Closing long & opening SHORT...")
+        result = trader.flip_to_short(coin)
+        action = "flip_to_short"
+    elif SELL_MODE == "open_short":
+        logger.info(f"[{coin}] Trend DOWN confirmed — opening SHORT")
+        notifier.send(f"🔴 [{coin}] Trend down! Opening SHORT...")
+        result = trader.open_short(coin)
+        action = "open_short"
+    else:
+        pct_label = f"{int(SELL_PCT * 100)}%"
+        logger.info(f"[{coin}] Trend DOWN confirmed — closing {pct_label} of long")
+        notifier.send(f"🔴 [{coin}] Trend down! Closing {pct_label} long...")
+        result = trader.close_long(coin, pct=SELL_PCT)
+        action = f"close_long_{pct_label}"
+
+    if COOLDOWN_SECONDS > 0:
+        cooldown_until[coin] = time.time() + COOLDOWN_SECONDS
+    notifier.send(f"✅ [{coin}] Trade executed: {result}")
+    return jsonify({"status": "trade_executed", "action": action, "coin": coin, "result": result})
+
+
+# ── Status / info ─────────────────────────────────────────────────────────────
+
+@app.route("/status", methods=["GET"])
+def status():
+    now = time.time()
+    out = {}
+    with lock:
+        for coin, sides in armed.items():
+            coin_status = {}
+            for side, ts in sides.items():
+                if ts is None:
+                    coin_status[side] = "idle"
+                elif now - ts > WINDOW_SECONDS:
+                    coin_status[side] = "expired"
+                else:
+                    coin_status[side] = {
+                        "armed":              True,
+                        "age_s":              int(now - ts),
+                        "window_remaining_s": int(WINDOW_SECONDS - (now - ts)),
+                        "waiting_for":        "trend-up" if side == "buy" else "trend-down",
+                    }
+            out[coin] = coin_status
+    cooldowns = {
+        coin: max(0, int(ts - now))
+        for coin, ts in cooldown_until.items()
+        if ts > now
+    }
+    return jsonify({
+        "coins":            out,
+        "cooldowns":        cooldowns,
+        "window_seconds":   WINDOW_SECONDS,
+        "sell_mode":        SELL_MODE,
+        "sell_pct":         SELL_PCT,
+        "cooldown_seconds": COOLDOWN_SECONDS,
+    })
+
+
+@app.route("/positions", methods=["GET"])
+def positions():
+    try:
+        return jsonify({"positions": trader.get_positions()})
+    except Exception as e:
+        logger.error(f"Failed to fetch positions: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok"})
+
+
+# ── Entrypoint (dev only — Gunicorn ignores this) ─────────────────────────────
+if __name__ == "__main__":
+    logger.info("PTOS Signal Tracker (Hyperliquid) starting in dev mode...")
+    app.run(host="0.0.0.0", port=5000, debug=False)

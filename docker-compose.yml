@@ -1,0 +1,18 @@
+# PTOS Signal Tracker — Hyperliquid Edition
+# All settings are in .env — edit that file, not this one.
+
+services:
+  signal-tracker:
+    build: .
+    container_name: PTOS_HL
+    restart: unless-stopped
+    ports:
+      - "5001:5000"
+    env_file:
+      - .env
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
