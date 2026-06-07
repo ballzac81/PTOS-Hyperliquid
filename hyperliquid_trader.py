@@ -4,7 +4,7 @@ Uses the official hyperliquid-python-sdk to open/close perp positions.
 
 Environment variables:
   HL_PRIVATE_KEY      Ethereum private key of your Hyperliquid wallet (required)
-  HL_WALLET_ADDRESS   Optional — if omitted, derived from private key
+  HL_WALLET_ADDRESS   Optional -- if omitted, derived from private key
   HL_TESTNET          "true" (default) or "false"
   POSITION_SIZE_PCT   Fraction of account equity per trade, e.g. "0.1" = 10%
   LEVERAGE            Integer leverage, e.g. "3"
@@ -36,9 +36,23 @@ def _retryable(fn):
     )(fn)
 
 
+def _round_price(price: float) -> float:
+    """Round price to appropriate precision for HL order placement."""
+    if price >= 10000:
+        return round(price, 1)
+    elif price >= 1000:
+        return round(price, 2)
+    elif price >= 100:
+        return round(price, 3)
+    elif price >= 1:
+        return round(price, 4)
+    else:
+        return round(price, 6)
+
+
 class HyperliquidTrader:
     def __init__(self):
-        # ── Validate required env vars on startup ─────────────────────────
+        # Validate required env vars on startup
         private_key = os.environ.get("HL_PRIVATE_KEY", "")
         if not private_key or private_key.startswith("0xYOUR"):
             raise ValueError(
@@ -56,8 +70,8 @@ class HyperliquidTrader:
         self.info     = Info(self.base_url, skip_ws=True)
         self.exchange = Exchange(self.account, self.base_url, account_address=self.address)
 
-        self.size_pct      = float(os.environ.get("POSITION_SIZE_PCT", "0.1"))
-        self.leverage      = int(os.environ.get("LEVERAGE", "3"))
+        self.size_pct         = float(os.environ.get("POSITION_SIZE_PCT", "0.1"))
+        self.leverage         = int(os.environ.get("LEVERAGE", "3"))
         self.leverage_mode    = os.environ.get("LEVERAGE_MODE", "cross")
         self.max_position_pct = float(os.environ.get("MAX_POSITION_SIZE_PCT", "0.5"))
 
@@ -68,7 +82,7 @@ class HyperliquidTrader:
             f"lev={self.leverage}x {self.leverage_mode}"
         )
 
-    # ── Internal helpers (with retry) ─────────────────────────────────────
+    # -- Internal helpers (with retry) ----------------------------------------
 
     @_retryable
     def _equity(self) -> float:
@@ -112,7 +126,7 @@ class HyperliquidTrader:
                 f"Increase POSITION_SIZE_PCT or add more equity."
             )
 
-        # Safety cap — hard ceiling regardless of POSITION_SIZE_PCT
+        # Safety cap -- hard ceiling regardless of POSITION_SIZE_PCT
         max_sz = round((equity * self.max_position_pct * self.leverage) / price, 4)
         if sz > max_sz:
             logger.warning(
@@ -122,8 +136,8 @@ class HyperliquidTrader:
             sz = max_sz
 
         logger.info(
-            f"[{coin}] Size: equity={equity:.2f} USDC × "
-            f"{self.size_pct * 100:.0f}% × {self.leverage}x / {price:.4f} = {sz}"
+            f"[{coin}] Size: equity={equity:.2f} USDC x "
+            f"{self.size_pct * 100:.0f}% x {self.leverage}x / {price:.4f} = {sz}"
         )
         return sz
 
@@ -141,7 +155,7 @@ class HyperliquidTrader:
                     return pos
         return None
 
-    # ── Public API ────────────────────────────────────────────────────────
+    # -- Public API -----------------------------------------------------------
 
     def get_price(self, coin: str) -> float:
         """Return the current mid price for a coin."""
@@ -219,6 +233,50 @@ class HyperliquidTrader:
         except Exception as e:
             logger.error(f"[{coin}] flip_to_short failed: {e}")
             return f"ERROR: {e}"
+
+    def place_stop_loss(self, coin: str, is_long: bool, stop_price: float, size: float) -> int:
+        """
+        Place a reduce-only stop-market order on Hyperliquid.
+        Survives container restarts -- lives on the exchange until cancelled or filled.
+        Returns the HL order ID (oid).
+        """
+        is_buy    = not is_long  # closing long = sell order, closing short = buy order
+        stop_price = _round_price(stop_price)
+
+        result = self.exchange.order(
+            coin,
+            is_buy,
+            size,
+            stop_price,
+            {"trigger": {"triggerPx": stop_price, "isMarket": True, "tpsl": "sl"}},
+            reduce_only=True,
+        )
+
+        if result.get("status") != "ok":
+            raise RuntimeError(f"place_stop_loss rejected: {result}")
+
+        statuses = result.get("response", {}).get("data", {}).get("statuses", [])
+        if not statuses:
+            raise RuntimeError(f"place_stop_loss: empty statuses in response: {result}")
+
+        status = statuses[0]
+        if "resting" in status:
+            oid = status["resting"]["oid"]
+            logger.info(
+                f"[{coin}] Native stop-loss placed | "
+                f"{'long' if is_long else 'short'} | "
+                f"stop={stop_price} | size={size} | oid={oid}"
+            )
+            return oid
+
+        raise RuntimeError(f"place_stop_loss: unexpected status format: {status}")
+
+    def cancel_order(self, coin: str, oid: int):
+        """Cancel an open order by ID. Raises on failure."""
+        result = self.exchange.cancel(coin, oid)
+        if result.get("status") != "ok":
+            raise RuntimeError(f"cancel_order failed: {result}")
+        logger.debug(f"[{coin}] Order {oid} cancelled")
 
     def get_positions(self) -> list:
         state     = self.info.user_state(self.address)
