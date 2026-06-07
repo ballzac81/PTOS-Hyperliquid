@@ -25,6 +25,7 @@ Manual overrides (require X-Webhook-Secret header or token in JSON body):
 import os
 import sys
 import time
+import signal
 import logging
 import threading
 from flask import Flask, request, jsonify
@@ -81,6 +82,22 @@ cooldown_until: dict = {}
 # Start trailing stop monitor at module level -- works with Gunicorn single worker
 monitor = PositionMonitor(trader, notifier, cooldown_until=cooldown_until, cooldown_seconds=COOLDOWN_SECONDS)
 monitor.start()
+
+# -- Startup / shutdown notifications ----------------------------------------
+
+def _shutdown_handler(signum, frame):
+    notifier.send("PTOS container shutting down -- no stop monitoring until restart!")
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, _shutdown_handler)
+
+net_label = "MAINNET" if os.environ.get("HL_TESTNET", "true").lower() == "false" else "TESTNET"
+notifier.send(
+    f"PTOS started ({net_label}) | "
+    f"trailing stop={float(os.environ.get('TRAILING_STOP_PCT', '0.05')) * 100:.0f}% | "
+    f"size={float(os.environ.get('POSITION_SIZE_PCT', '0.1')) * 100:.0f}% | "
+    f"lev={os.environ.get('LEVERAGE', '3')}x"
+)
 
 
 # -- Helpers ------------------------------------------------------------------
