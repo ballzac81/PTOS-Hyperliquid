@@ -33,19 +33,10 @@ class PositionMonitor:
         self.trail_pct = float(os.environ.get("TRAILING_STOP_PCT", "0.05"))
         self.interval  = int(os.environ.get("MONITOR_INTERVAL_SECONDS", "30"))
 
-        # best[(coin, side)] = best price seen since position first detected
-        #   long  -> highest price (stop fires if price drops trail_pct below this)
-        #   short -> lowest price  (stop fires if price rises trail_pct above this)
         self._best: dict = {}
-
-        # Native resting stop orders on HL: (coin, side) -> HL order ID
-        # These survive container restarts on the exchange side.
         self._stop_orders: dict = {}
-
-        self._cooldown_until   = cooldown_until  # shared ref from signal_tracker
+        self._cooldown_until   = cooldown_until
         self._cooldown_seconds = cooldown_seconds
-
-        # Tracks coins currently being closed to prevent double-close race condition
         self._closing: set = set()
         self._stop         = threading.Event()
 
@@ -71,11 +62,7 @@ class PositionMonitor:
 
     # -- Native stop order helpers --------------------------------------------
 
-    def _place_native_stop(self, coin: str, side: str, stop_price: float, size: float) -> int | None:
-        """
-        Place a reduce-only stop-market on HL. Returns order ID or None on failure.
-        Failure is non-fatal -- the polling loop still acts as backstop.
-        """
+    def _place_native_stop(self, coin: str, side: str, stop_price: float, size: float):
         try:
             oid = self.trader.place_stop_loss(
                 coin,
@@ -91,10 +78,6 @@ class PositionMonitor:
             return None
 
     def _cancel_native_stop(self, coin: str, side: str):
-        """
-        Cancel the tracked resting stop order for this position.
-        Silently ignores errors (order may have already filled or been cancelled).
-        """
         key = (coin, side)
         oid = self._stop_orders.pop(key, None)
         if oid is None:
@@ -103,11 +86,9 @@ class PositionMonitor:
             self.trader.cancel_order(coin, oid)
             logger.debug(f"[{coin}] Native stop cancelled | oid={oid}")
         except Exception as e:
-            # This is expected if the native stop already triggered
             logger.debug(f"[{coin}] Native stop cancel failed (may have filled): {e}")
 
     def _update_native_stop(self, coin: str, side: str, new_stop_px: float, size: float):
-        """Cancel old native stop and place a new one at the updated trailing level."""
         self._cancel_native_stop(coin, side)
         oid = self._place_native_stop(coin, side, new_stop_px, size)
         if oid is not None:
@@ -130,7 +111,6 @@ class PositionMonitor:
             key  = (coin, side)
             active_keys.add(key)
 
-            # Skip if a close is already in flight for this position
             if key in self._closing:
                 continue
 
@@ -197,16 +177,13 @@ class PositionMonitor:
                 del self._best[key]
 
     def _trigger(self, coin: str, side: str, price: float, best: float, stop_px: float):
-        """Polling backstop fired. Cancel native stop to prevent double-fill, then market close."""
         key = (coin, side)
 
-        # Guard against double-close if two checks overlap
         if key in self._closing:
             logger.debug(f"[{coin}] Close already in progress for {side} -- skipping")
             return
         self._closing.add(key)
 
-        # Cancel native resting stop first to prevent double-fill on exchange
         self._cancel_native_stop(coin, side)
 
         pct_move = abs(price - best) / best * 100
@@ -230,3 +207,13 @@ class PositionMonitor:
             if self._cooldown_until is not None and self._cooldown_seconds > 0:
                 self._cooldown_until[coin] = time.time() + self._cooldown_seconds
                 logger.info(f"[{coin}] Cooldown set for {self._cooldown_seconds}s")
+            self.notifier.send(
+                f"[{coin}] {side.capitalize()} closed -- back to idle\n"
+                f"Result: {result}"
+            )
+        except Exception as e:
+            logger.error(f"[{coin}] Failed to close {side} on trailing stop: {e}")
+            self.notifier.send(f"[{coin}] Trailing stop FAILED to close {side}: {e}")
+        finally:
+            self._best.pop(key, None)
+            self._closing.discard(key)
