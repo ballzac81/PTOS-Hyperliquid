@@ -190,15 +190,15 @@ trend confirms. Set a value if you want signals to expire:
 
 ### 1. Get your Hyperliquid keys
 
-Hyperliquid uses two separate values that work together:
+Hyperliquid uses three things that work together:
 
 **Step 1 -- Generate an API wallet**
 
 In the Hyperliquid app: **Settings -> API -> Generate API wallet**
 
 This creates a sub-wallet specifically for trading. Copy its **private key**
-into `HL_PRIVATE_KEY` in your `.env`. This key has limited permissions --
-it can place and cancel orders but **cannot withdraw funds**. It is safe to
+into HL_PRIVATE_KEY in your .env. This key has limited permissions --
+it can place and cancel orders but cannot withdraw funds. It is safe to
 use in the bot.
 
 > Never put your main wallet's private key into the bot. If the server is
@@ -206,20 +206,45 @@ use in the bot.
 
 **Step 2 -- Add your main wallet address**
 
-Your USDC balance lives on your **main wallet**, not the API sub-wallet.
+Your USDC balance lives on your main wallet, not the API sub-wallet.
 Copy your main wallet's public address (shown in the top-right of
-app.hyperliquid.xyz) into `HL_WALLET_ADDRESS` in your `.env`.
+app.hyperliquid.xyz) into HL_WALLET_ADDRESS in your .env.
 
 The bot signs orders with the API key but executes them against your main
 wallet's balance -- this is how Hyperliquid's API wallet system is designed
 to work.
 
-HL_PRIVATE_KEY=0xYOUR_API_WALLET_PRIVATE_KEY
-HL_WALLET_ADDRESS=0xYOUR_MAIN_WALLET_PUBLIC_ADDRESS
+    HL_PRIVATE_KEY=0xYOUR_API_WALLET_PRIVATE_KEY
+    HL_WALLET_ADDRESS=0xYOUR_MAIN_WALLET_PUBLIC_ADDRESS
 
-> If `HL_WALLET_ADDRESS` is left blank, the bot trades against the API
+> If HL_WALLET_ADDRESS is left blank, the bot trades against the API
 > wallet's own balance (which is $0) and every trade will fail with a
 > "size below minimum" error.
+
+**Step 3 -- Set your account type to Manual**
+
+Go to app.hyperliquid.xyz/portfolio and click the Account Type button.
+
+> This is the critical step most people miss.
+
+Hyperliquid has three account types. The bot requires Manual mode:
+
+| Account Type     | What it does                                                  |
+|------------------|---------------------------------------------------------------|
+| Unified          | Perp API reports $0 even with USDC in spot -- trades fail     |
+| Portfolio Margin | Not compatible with this bot                                  |
+| Manual           | Separate perp balance the API reads correctly -- use this     |
+
+After switching to Manual, go to Balances -> Transfer and move your USDC
+from spot into your perp account.
+
+Verify the bot can see your balance:
+
+    curl -X POST https://api.hyperliquid.xyz/info \
+      -H "Content-Type: application/json" \
+      -d '{"type": "clearinghouseState", "user": "0xYOUR_MAIN_WALLET_ADDRESS"}'
+
+Look for "accountValue" -- it should match your perp balance.
 
 ### 2. Configure
 
