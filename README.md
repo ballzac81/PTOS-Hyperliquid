@@ -118,10 +118,11 @@ cp .env.example .env
 
 ### Required
 
-| Setting          | Description                                           |
-|------------------|-------------------------------------------------------|
-| `HL_PRIVATE_KEY` | Your Hyperliquid wallet private key                   |
-| `SECRET_TOKEN`   | Random string -- paste into every TradingView alert   |
+| Setting              | Description                                                        |
+|----------------------|--------------------------------------------------------------------|
+| `HL_PRIVATE_KEY`     | Private key of your **API sub-wallet** (generated in HL Settings)  |
+| `HL_WALLET_ADDRESS`  | Public address of your **main wallet** (where your USDC lives)     |
+| `SECRET_TOKEN`       | Random string -- paste into every TradingView alert                |
 
 ### Network
 
@@ -187,13 +188,38 @@ trend confirms. Set a value if you want signals to expire:
 
 ## Setup
 
-### 1. Get your Hyperliquid private key
+### 1. Get your Hyperliquid keys
 
-> Use a **dedicated trading wallet** with only the funds you intend to
-> trade. Never use your main wallet.
+Hyperliquid uses two separate values that work together:
 
-In the Hyperliquid app: **Settings -> API -> Generate API wallet**, then copy
-the private key. Or export from MetaMask if that's what you connected.
+**Step 1 -- Generate an API wallet**
+
+In the Hyperliquid app: **Settings -> API -> Generate API wallet**
+
+This creates a sub-wallet specifically for trading. Copy its **private key**
+into `HL_PRIVATE_KEY` in your `.env`. This key has limited permissions --
+it can place and cancel orders but **cannot withdraw funds**. It is safe to
+use in the bot.
+
+> Never put your main wallet's private key into the bot. If the server is
+> ever compromised, a main wallet key gives full withdrawal access.
+
+**Step 2 -- Add your main wallet address**
+
+Your USDC balance lives on your **main wallet**, not the API sub-wallet.
+Copy your main wallet's public address (shown in the top-right of
+app.hyperliquid.xyz) into `HL_WALLET_ADDRESS` in your `.env`.
+
+The bot signs orders with the API key but executes them against your main
+wallet's balance -- this is how Hyperliquid's API wallet system is designed
+to work.
+
+HL_PRIVATE_KEY=0xYOUR_API_WALLET_PRIVATE_KEY
+HL_WALLET_ADDRESS=0xYOUR_MAIN_WALLET_PUBLIC_ADDRESS
+
+> If `HL_WALLET_ADDRESS` is left blank, the bot trades against the API
+> wallet's own balance (which is $0) and every trade will fail with a
+> "size below minimum" error.
 
 ### 2. Configure
 
