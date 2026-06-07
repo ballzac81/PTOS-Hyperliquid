@@ -152,6 +152,14 @@ class PositionMonitor:
                     f"ref={price:.4f} | "
                     f"stop={'below' if side == 'long' else 'above'} {stop_px:.4f}"
                 )
+                # Cancel any orphaned stop orders left from a previous container run
+                orphans = self.trader.get_open_stop_orders(coin)
+                for orphan_oid in orphans:
+                    try:
+                        self.trader.cancel_order(coin, orphan_oid)
+                        logger.info(f"[{coin}] Orphaned stop cancelled | oid={orphan_oid}")
+                    except Exception as e:
+                        logger.debug(f"[{coin}] Could not cancel orphan oid={orphan_oid}: {e}")
                 oid = self._place_native_stop(coin, side, stop_px, size)
                 if oid is not None:
                     self._stop_orders[key] = oid
@@ -222,14 +230,3 @@ class PositionMonitor:
             if self._cooldown_until is not None and self._cooldown_seconds > 0:
                 self._cooldown_until[coin] = time.time() + self._cooldown_seconds
                 logger.info(f"[{coin}] Cooldown set for {self._cooldown_seconds}s")
-            self.notifier.send(
-                f"[{coin}] {side.capitalize()} closed -- back to idle\n"
-                f"Result: {result}"
-            )
-        except Exception as e:
-            logger.error(f"[{coin}] Failed to close {side} on trailing stop: {e}")
-            self.notifier.send(f"[{coin}] Trailing stop FAILED to close {side}: {e}")
-        finally:
-            # Always clean up so we don't retry on the next check
-            self._best.pop(key, None)
-            self._closing.discard(key)

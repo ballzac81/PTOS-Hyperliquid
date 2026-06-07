@@ -278,6 +278,26 @@ class HyperliquidTrader:
             raise RuntimeError(f"cancel_order failed: {result}")
         logger.debug(f"[{coin}] Order {oid} cancelled")
 
+    def get_open_stop_orders(self, coin: str) -> list[int]:
+        """
+        Return order IDs of any resting trigger/stop orders for a coin.
+        Used on startup to cancel orphaned stops from a previous container run.
+        """
+        try:
+            orders = self.info.open_orders(self.address)
+            oids = []
+            for o in orders:
+                if o.get("coin") != coin:
+                    continue
+                # Trigger orders have an 'orderType' containing 'Stop' or a triggerCondition
+                order_type = o.get("orderType", "")
+                if "Stop" in order_type or "Trigger" in order_type:
+                    oids.append(o["oid"])
+            return oids
+        except Exception as e:
+            logger.warning(f"[{coin}] Could not fetch open orders: {e}")
+            return []
+
     def get_positions(self) -> list:
         state     = self.info.user_state(self.address)
         positions = []
@@ -290,23 +310,4 @@ class HyperliquidTrader:
                 "coin":           pos.get("coin"),
                 "side":           "long" if szi > 0 else "short",
                 "size":           abs(szi),
-                "entry_price":    float(pos.get("entryPx", 0)),
-                "unrealized_pnl": float(pos.get("unrealizedPnl", 0)),
-                "leverage":       pos.get("leverage", {}),
-                "liquidation_px": pos.get("liquidationPx"),
-                "margin_used":    float(pos.get("marginUsed", 0)),
-            })
-        return positions
-
-    @staticmethod
-    def _format_result(result) -> str:
-        if isinstance(result, dict):
-            if result.get("status") == "ok":
-                fills = result.get("response", {}).get("data", {}).get("statuses", [])
-                if fills and "filled" in fills[0]:
-                    d = fills[0]["filled"]
-                    return (
-                        f"filled: {d.get('totalSz')} @ avg {d.get('avgPx')} "
-                        f"(oid={d.get('oid')})"
-                    )
-        return str(result)
+                "entry_price":    float(pos.get("en
