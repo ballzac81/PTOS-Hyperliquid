@@ -45,7 +45,7 @@ def _round_price(price: float) -> float:
     elif price >= 100:
         return round(price, 3)
     elif price >= 1:
-        return round(price, 4)
+        return round(price, 3)
     else:
         return round(price, 6)
 
