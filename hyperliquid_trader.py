@@ -275,8 +275,9 @@ class HyperliquidTrader:
 
     def get_open_stop_orders(self, coin: str) -> list:
         """
-        Return order IDs of any resting trigger/stop orders for a coin.
+        Return order IDs of any resting reduce-only orders for a coin.
         Used on startup to cancel orphaned stops from a previous container run.
+        HL stop orders appear in open_orders as reduce_only=True with no orderType field.
         """
         try:
             orders = self.info.open_orders(self.address)
@@ -284,8 +285,8 @@ class HyperliquidTrader:
             for o in orders:
                 if o.get("coin") != coin:
                     continue
-                order_type = o.get("orderType", "")
-                if "Stop" in order_type or "Trigger" in order_type:
+                # All bot-placed stops are reduce-only -- use this to identify them
+                if o.get("reduceOnly", False):
                     oids.append(o["oid"])
             return oids
         except Exception as e:
