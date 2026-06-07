@@ -52,7 +52,6 @@ def _round_price(price: float) -> float:
 
 class HyperliquidTrader:
     def __init__(self):
-        # Validate required env vars on startup
         private_key = os.environ.get("HL_PRIVATE_KEY", "")
         if not private_key or private_key.startswith("0xYOUR"):
             raise ValueError(
@@ -105,12 +104,11 @@ class HyperliquidTrader:
             logger.warning(f"[{coin}] Could not set leverage (continuing): {e}")
 
     def _calc_size(self, coin: str) -> float:
-        equity   = self._equity()          # single API call, reused below
+        equity   = self._equity()
         price    = self._mid(coin)
         notional = equity * self.size_pct * self.leverage
         sz       = notional / price
 
-        # Round to reasonable precision based on price magnitude
         if price > 10000:
             sz = round(sz, 4)
         elif price > 1000:
@@ -126,7 +124,6 @@ class HyperliquidTrader:
                 f"Increase POSITION_SIZE_PCT or add more equity."
             )
 
-        # Safety cap -- hard ceiling regardless of POSITION_SIZE_PCT
         max_sz = round((equity * self.max_position_pct * self.leverage) / price, 4)
         if sz > max_sz:
             logger.warning(
@@ -158,7 +155,6 @@ class HyperliquidTrader:
     # -- Public API -----------------------------------------------------------
 
     def get_price(self, coin: str) -> float:
-        """Return the current mid price for a coin."""
         return self._mid(coin)
 
     def open_long(self, coin: str) -> str:
@@ -212,7 +208,6 @@ class HyperliquidTrader:
             return f"ERROR: {e}"
 
     def flip_to_short(self, coin: str) -> str:
-        """Close any open long on coin, then open a short."""
         messages = []
         try:
             pos = self._position(coin, "long")
@@ -240,7 +235,7 @@ class HyperliquidTrader:
         Survives container restarts -- lives on the exchange until cancelled or filled.
         Returns the HL order ID (oid).
         """
-        is_buy    = not is_long  # closing long = sell order, closing short = buy order
+        is_buy     = not is_long
         stop_price = _round_price(stop_price)
 
         result = self.exchange.order(
@@ -278,7 +273,7 @@ class HyperliquidTrader:
             raise RuntimeError(f"cancel_order failed: {result}")
         logger.debug(f"[{coin}] Order {oid} cancelled")
 
-    def get_open_stop_orders(self, coin: str) -> list[int]:
+    def get_open_stop_orders(self, coin: str) -> list:
         """
         Return order IDs of any resting trigger/stop orders for a coin.
         Used on startup to cancel orphaned stops from a previous container run.
@@ -289,7 +284,6 @@ class HyperliquidTrader:
             for o in orders:
                 if o.get("coin") != coin:
                     continue
-                # Trigger orders have an 'orderType' containing 'Stop' or a triggerCondition
                 order_type = o.get("orderType", "")
                 if "Stop" in order_type or "Trigger" in order_type:
                     oids.append(o["oid"])
@@ -310,4 +304,23 @@ class HyperliquidTrader:
                 "coin":           pos.get("coin"),
                 "side":           "long" if szi > 0 else "short",
                 "size":           abs(szi),
-                "entry_price":    float(pos.get("en
+                "entry_price":    float(pos.get("entryPx", 0)),
+                "unrealized_pnl": float(pos.get("unrealizedPnl", 0)),
+                "leverage":       pos.get("leverage", {}),
+                "liquidation_px": pos.get("liquidationPx"),
+                "margin_used":    float(pos.get("marginUsed", 0)),
+            })
+        return positions
+
+    @staticmethod
+    def _format_result(result) -> str:
+        if isinstance(result, dict):
+            if result.get("status") == "ok":
+                fills = result.get("response", {}).get("data", {}).get("statuses", [])
+                if fills and "filled" in fills[0]:
+                    d = fills[0]["filled"]
+                    return (
+                        f"filled: {d.get('totalSz')} @ avg {d.get('avgPx')} "
+                        f"(oid={d.get('oid')})"
+                    )
+        return str(result)
