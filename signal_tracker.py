@@ -4,14 +4,11 @@ Listens for TradingView webhooks and executes perp trades on Hyperliquid.
 
 BUY flow:
   POST /buy-signal       Arm (or refresh) the buy watch. Can fire multiple times.
-  POST /trend-up         Trend confirmed up -> open long (only if buy is armed)
+  POST /trend-up         Trend confirmed up -> open long (or flip short to long)
 
 SELL flow:
   POST /sell-signal      Arm (or refresh) the sell watch. Can fire multiple times.
-  POST /trend-down       Trend confirmed down -> close long / open short (only if sell is armed)
-
-Buy and sell are tracked independently per coin -- a sell signal won't cancel
-a pending buy, and vice versa.
+  POST /trend-down       Trend confirmed down -> close long / open short
 
 Manual overrides (require X-Webhook-Secret header or token in JSON body):
   POST /emergency-close  Close ALL open positions to USDC + disarm all signals + cooldown
@@ -90,7 +87,7 @@ monitor = PositionMonitor(
 )
 monitor.start()
 
-# -- SIGTERM handler (Telegram notification on container shutdown) -------------
+# -- SIGTERM handler ----------------------------------------------------------
 def _shutdown_handler(signum, frame):
     notifier.send("PTOS container shutting down -- no stop monitoring until restart!")
     sys.exit(0)
@@ -98,7 +95,7 @@ def _shutdown_handler(signum, frame):
 signal.signal(signal.SIGTERM, _shutdown_handler)
 
 # -- Startup Telegram notification --------------------------------------------
-net_label = "MAINNET" if os.environ.get("HL_TESTNET", "true").lower() == "false" else "TESTNET"
+net_label   = "MAINNET" if os.environ.get("HL_TESTNET", "true").lower() == "false" else "TESTNET"
 rearm_label = f" | rearm={REARM_DELAY_SECONDS}s" if REARM_AFTER_STOP else ""
 notifier.send(
     f"PTOS started ({net_label}) | "
@@ -211,13 +208,25 @@ def trend_up():
         notifier.send(f"[{coin}] Trend-up ignored -- cooldown active ({remaining}s remaining)")
         return jsonify({"status": "cooldown", "coin": coin, "cooldown_remaining_s": remaining}), 200
 
-    logger.info(f"[{coin}] Trend UP confirmed -- executing LONG")
-    notifier.send(f"[{coin}] Trend up! Opening LONG on Hyperliquid...")
-    result = trader.open_long(coin)
+    # Check if a short is already open -- if so, flip to long
+    positions = trader.get_positions()
+    has_short = any(p["coin"] == coin and p["side"] == "short" for p in positions)
+
+    if has_short:
+        logger.info(f"[{coin}] Trend UP confirmed -- flipping SHORT to LONG")
+        notifier.send(f"[{coin}] Trend up! Closing SHORT and opening LONG...")
+        result = trader.flip_to_long(coin)
+        action = "flip_to_long"
+    else:
+        logger.info(f"[{coin}] Trend UP confirmed -- executing LONG")
+        notifier.send(f"[{coin}] Trend up! Opening LONG on Hyperliquid...")
+        result = trader.open_long(coin)
+        action = "open_long"
+
     if COOLDOWN_SECONDS > 0:
         cooldown_until[coin] = time.time() + COOLDOWN_SECONDS
-    notifier.send(f"[{coin}] Long opened: {result}")
-    return jsonify({"status": "trade_executed", "action": "open_long", "coin": coin, "result": result})
+    notifier.send(f"[{coin}] Trade executed: {result}")
+    return jsonify({"status": "trade_executed", "action": action, "coin": coin, "result": result})
 
 
 # -- SELL flow ----------------------------------------------------------------
@@ -402,13 +411,13 @@ def status():
         if ts > now
     }
     return jsonify({
-        "coins":              out,
-        "cooldowns":          cooldowns,
-        "window_seconds":     WINDOW_SECONDS,
-        "sell_mode":          SELL_MODE,
-        "sell_pct":           SELL_PCT,
-        "cooldown_seconds":   COOLDOWN_SECONDS,
-        "rearm_after_stop":   REARM_AFTER_STOP,
+        "coins":               out,
+        "cooldowns":           cooldowns,
+        "window_seconds":      WINDOW_SECONDS,
+        "sell_mode":           SELL_MODE,
+        "sell_pct":            SELL_PCT,
+        "cooldown_seconds":    COOLDOWN_SECONDS,
+        "rearm_after_stop":    REARM_AFTER_STOP,
         "rearm_delay_seconds": REARM_DELAY_SECONDS,
     })
 

@@ -42,8 +42,6 @@ def _round_price(price: float) -> float:
         return round(price, 1)
     elif price >= 1000:
         return round(price, 2)
-    elif price >= 100:
-        return round(price, 3)
     elif price >= 1:
         return round(price, 3)
     else:
@@ -81,7 +79,7 @@ class HyperliquidTrader:
             f"lev={self.leverage}x {self.leverage_mode}"
         )
 
-    # -- Internal helpers (with retry) ----------------------------------------
+    # -- Internal helpers -----------------------------------------------------
 
     @_retryable
     def _equity(self) -> float:
@@ -139,7 +137,7 @@ class HyperliquidTrader:
         return sz
 
     @_retryable
-    def _position(self, coin: str, side: str) -> dict | None:
+    def _position(self, coin: str, side: str):
         state     = self.info.user_state(self.address)
         positions = state.get("assetPositions", [])
         for entry in positions:
@@ -208,6 +206,7 @@ class HyperliquidTrader:
             return f"ERROR: {e}"
 
     def flip_to_short(self, coin: str) -> str:
+        """Close any open long on coin, then open a short."""
         messages = []
         try:
             pos = self._position(coin, "long")
@@ -229,10 +228,32 @@ class HyperliquidTrader:
             logger.error(f"[{coin}] flip_to_short failed: {e}")
             return f"ERROR: {e}"
 
+    def flip_to_long(self, coin: str) -> str:
+        """Close any open short on coin, then open a long."""
+        messages = []
+        try:
+            pos = self._position(coin, "short")
+            if pos:
+                sz           = abs(float(pos["szi"]))
+                close_result = self.exchange.market_close(coin, sz=sz, slippage=SLIPPAGE)
+                msg          = f"short closed ({sz}): {self._format_result(close_result)}"
+                messages.append(msg)
+                logger.info(f"[{coin}] Flip: {msg}")
+
+            self._set_leverage(coin)
+            sz     = self._calc_size(coin)
+            result = self.exchange.market_open(coin, is_buy=True, sz=sz, slippage=SLIPPAGE)
+            msg    = f"long opened ({sz}): {self._format_result(result)}"
+            messages.append(msg)
+            logger.info(f"[{coin}] Flip: {msg}")
+            return " | ".join(messages)
+        except Exception as e:
+            logger.error(f"[{coin}] flip_to_long failed: {e}")
+            return f"ERROR: {e}"
+
     def place_stop_loss(self, coin: str, is_long: bool, stop_price: float, size: float) -> int:
         """
         Place a reduce-only stop-market order on Hyperliquid.
-        Survives container restarts -- lives on the exchange until cancelled or filled.
         Returns the HL order ID (oid).
         """
         is_buy     = not is_long
@@ -277,7 +298,6 @@ class HyperliquidTrader:
         """
         Return order IDs of any resting reduce-only orders for a coin.
         Used on startup to cancel orphaned stops from a previous container run.
-        HL stop orders appear in open_orders as reduce_only=True with no orderType field.
         """
         try:
             orders = self.info.open_orders(self.address)
@@ -285,7 +305,6 @@ class HyperliquidTrader:
             for o in orders:
                 if o.get("coin") != coin:
                     continue
-                # All bot-placed stops are reduce-only -- use this to identify them
                 if o.get("reduceOnly", False):
                     oids.append(o["oid"])
             return oids
