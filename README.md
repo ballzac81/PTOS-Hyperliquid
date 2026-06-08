@@ -152,9 +152,39 @@ cp .env.example .env
 |----------------------------|---------|-------------------------------------------------------|
 | `TRAILING_STOP_PCT`        | `0.05`  | Close if price pulls back this % from peak (0 = off)  |
 | `MONITOR_INTERVAL_SECONDS` | `30`    | Polling backstop check interval (seconds)             |
+| `REARM_AFTER_STOP`         | `false` | Auto re-arm signal after stop-out (see below)         |
+| `REARM_DELAY_SECONDS`      | `3600`  | Seconds to wait before re-arming (default 1 hour)     |
 
 The trailing stop places a native reduce-only order on HL and updates it as
 the peak moves. Set `TRAILING_STOP_PCT=0` to disable both layers entirely.
+
+#### Re-arm after stop-out (`REARM_AFTER_STOP`)
+
+When enabled, if a trailing stop closes a position the bot automatically
+re-arms the same signal direction after `REARM_DELAY_SECONDS`. If the trend
+confirms again within `WINDOW_SECONDS`, it re-enters without needing a new
+TradingView signal.
+
+Example with a long position:
+```
+Trailing stop fires → long closed
+  → wait REARM_DELAY_SECONDS (e.g. 1 hour)
+  → buy signal auto re-armed
+  → next /trend-up → re-enters long
+  → if trend-up never fires within WINDOW_SECONDS → signal expires, stays idle
+```
+
+**Recommended settings by timeframe:**
+
+| Timeframe | `REARM_DELAY_SECONDS` | `WINDOW_SECONDS` |
+|-----------|-----------------------|-----------------|
+| 30m       | `3600` (2 candles)    | `7200`          |
+| 4h        | `14400` (1 candle)    | `28800`         |
+| 1d        | `86400` (1 candle)    | `172800`        |
+
+> **Note:** On lower timeframes (30m), a wider `TRAILING_STOP_PCT` is usually
+> safer than enabling re-arm. Re-arm is better suited to 4h+ charts where
+> trends are cleaner and fakeouts are rarer.
 
 ### Cooldown & safety
 
@@ -190,15 +220,15 @@ trend confirms. Set a value if you want signals to expire:
 
 ### 1. Get your Hyperliquid keys
 
-Hyperliquid uses three things that work together:
+Hyperliquid uses two separate values that work together:
 
 **Step 1 -- Generate an API wallet**
 
 In the Hyperliquid app: **Settings -> API -> Generate API wallet**
 
 This creates a sub-wallet specifically for trading. Copy its **private key**
-into HL_PRIVATE_KEY in your .env. This key has limited permissions --
-it can place and cancel orders but cannot withdraw funds. It is safe to
+into `HL_PRIVATE_KEY` in your `.env`. This key has limited permissions --
+it can place and cancel orders but **cannot withdraw funds**. It is safe to
 use in the bot.
 
 > Never put your main wallet's private key into the bot. If the server is
@@ -206,45 +236,49 @@ use in the bot.
 
 **Step 2 -- Add your main wallet address**
 
-Your USDC balance lives on your main wallet, not the API sub-wallet.
+Your USDC balance lives on your **main wallet**, not the API sub-wallet.
 Copy your main wallet's public address (shown in the top-right of
-app.hyperliquid.xyz) into HL_WALLET_ADDRESS in your .env.
+app.hyperliquid.xyz) into `HL_WALLET_ADDRESS` in your `.env`.
 
 The bot signs orders with the API key but executes them against your main
 wallet's balance -- this is how Hyperliquid's API wallet system is designed
 to work.
 
-    HL_PRIVATE_KEY=0xYOUR_API_WALLET_PRIVATE_KEY
-    HL_WALLET_ADDRESS=0xYOUR_MAIN_WALLET_PUBLIC_ADDRESS
+```
+HL_PRIVATE_KEY=0xYOUR_API_WALLET_PRIVATE_KEY
+HL_WALLET_ADDRESS=0xYOUR_MAIN_WALLET_PUBLIC_ADDRESS
+```
 
-> If HL_WALLET_ADDRESS is left blank, the bot trades against the API
+> If `HL_WALLET_ADDRESS` is left blank, the bot trades against the API
 > wallet's own balance (which is $0) and every trade will fail with a
 > "size below minimum" error.
 
 **Step 3 -- Set your account type to Manual**
 
-Go to app.hyperliquid.xyz/portfolio and click the Account Type button.
+Go to **app.hyperliquid.xyz/portfolio** and click the **Account Type** button.
 
 > This is the critical step most people miss.
 
-Hyperliquid has three account types. The bot requires Manual mode:
+Hyperliquid has three account types. The bot requires **Manual** mode:
 
-| Account Type     | What it does                                                  |
-|------------------|---------------------------------------------------------------|
-| Unified          | Perp API reports $0 even with USDC in spot -- trades fail     |
-| Portfolio Margin | Not compatible with this bot                                  |
-| Manual           | Separate perp balance the API reads correctly -- use this     |
+| Account Type     | What it does                                                     |
+|------------------|------------------------------------------------------------------|
+| Unified          | Spot and perp balances are separate -- perp API shows $0 even if you have USDC in spot |
+| Portfolio Margin | Spot assets used as perp collateral -- not compatible with this bot |
+| **Manual**       | **Separate perp balance the API can read correctly -- use this** |
 
-After switching to Manual, go to Balances -> Transfer and move your USDC
-from spot into your perp account.
+After switching to Manual, go to **Balances -> Transfer** and move your USDC
+from spot into your perp account. The bot reads perp margin balance only --
+if it shows $0 in the API, your trades will fail with "size below minimum".
 
-Verify the bot can see your balance:
+You can verify the bot sees your balance with:
+```bash
+curl -X POST https://api.hyperliquid.xyz/info \
+  -H "Content-Type: application/json" \
+  -d '{"type": "clearinghouseState", "user": "0xYOUR_MAIN_WALLET_ADDRESS"}'
+```
 
-    curl -X POST https://api.hyperliquid.xyz/info \
-      -H "Content-Type: application/json" \
-      -d '{"type": "clearinghouseState", "user": "0xYOUR_MAIN_WALLET_ADDRESS"}'
-
-Look for "accountValue" -- it should match your perp balance.
+Look for `"accountValue"` -- it should match your perp balance.
 
 ### 2. Configure
 

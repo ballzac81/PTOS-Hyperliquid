@@ -36,10 +36,12 @@ from telegram_notify import TelegramNotifier
 from position_monitor import PositionMonitor
 
 # -- Config -------------------------------------------------------------------
-SECRET_TOKEN   = os.environ.get("SECRET_TOKEN", "")
-WINDOW_SECONDS = int(os.environ.get("WINDOW_SECONDS", 0))  # 0 = no expiry
-SELL_MODE      = os.environ.get("SELL_MODE", "short")      # "short" | "close_long" | "open_short"
-SELL_PCT       = float(os.environ.get("SELL_PCT", "1.0"))
+SECRET_TOKEN         = os.environ.get("SECRET_TOKEN", "")
+WINDOW_SECONDS       = int(os.environ.get("WINDOW_SECONDS", 0))
+SELL_MODE            = os.environ.get("SELL_MODE", "short")
+SELL_PCT             = float(os.environ.get("SELL_PCT", "1.0"))
+REARM_AFTER_STOP     = os.environ.get("REARM_AFTER_STOP", "false").lower() == "true"
+REARM_DELAY_SECONDS  = int(os.environ.get("REARM_DELAY_SECONDS", "3600"))
 
 # -- Startup validation -------------------------------------------------------
 if SELL_MODE not in ("short", "close_long", "open_short"):
@@ -65,45 +67,50 @@ limiter = Limiter(
     storage_uri="memory://",
 )
 
-# -- Core services (module-level so Gunicorn picks them up) -------------------
+# -- Core services ------------------------------------------------------------
 trader   = HyperliquidTrader()
 notifier = TelegramNotifier()
 lock     = threading.Lock()
 
 # -- State --------------------------------------------------------------------
-# armed[coin]["buy"]  = timestamp of last buy-signal  (or None)
-# armed[coin]["sell"] = timestamp of last sell-signal (or None)
 armed: dict = {}
-
-# cooldown_until[coin] = timestamp before which no new trade executes
 COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "0"))
 cooldown_until: dict = {}
 
-# Start trailing stop monitor at module level -- works with Gunicorn single worker
-monitor = PositionMonitor(trader, notifier, cooldown_until=cooldown_until, cooldown_seconds=COOLDOWN_SECONDS)
+# Start trailing stop monitor
+monitor = PositionMonitor(
+    trader,
+    notifier,
+    cooldown_until=cooldown_until,
+    cooldown_seconds=COOLDOWN_SECONDS,
+    armed=armed,
+    armed_lock=lock,
+    rearm_after_stop=REARM_AFTER_STOP,
+    rearm_delay_seconds=REARM_DELAY_SECONDS,
+)
 monitor.start()
 
-# -- Startup / shutdown notifications ----------------------------------------
-
+# -- SIGTERM handler (Telegram notification on container shutdown) -------------
 def _shutdown_handler(signum, frame):
     notifier.send("PTOS container shutting down -- no stop monitoring until restart!")
     sys.exit(0)
 
 signal.signal(signal.SIGTERM, _shutdown_handler)
 
+# -- Startup Telegram notification --------------------------------------------
 net_label = "MAINNET" if os.environ.get("HL_TESTNET", "true").lower() == "false" else "TESTNET"
+rearm_label = f" | rearm={REARM_DELAY_SECONDS}s" if REARM_AFTER_STOP else ""
 notifier.send(
     f"PTOS started ({net_label}) | "
     f"trailing stop={float(os.environ.get('TRAILING_STOP_PCT', '0.05')) * 100:.0f}% | "
     f"size={float(os.environ.get('POSITION_SIZE_PCT', '0.1')) * 100:.0f}% | "
     f"lev={os.environ.get('LEVERAGE', '3')}x"
+    f"{rearm_label}"
 )
-
 
 # -- Helpers ------------------------------------------------------------------
 
 def normalize_coin(raw: str) -> str:
-    """Strip exchange suffixes: 'SOL/USD' -> 'SOL'."""
     coin = raw.upper().strip()
     for suffix in [
         "/USD", "/USDC", "/USDT", "/BUSD", "/PERP",
@@ -119,7 +126,6 @@ def normalize_coin(raw: str) -> str:
 def verify_token(data: dict) -> bool:
     if not SECRET_TOKEN:
         return True
-    # Accept secret via JSON body OR X-Webhook-Secret header
     return (
         data.get("token") == SECRET_TOKEN
         or request.headers.get("X-Webhook-Secret") == SECRET_TOKEN
@@ -131,12 +137,11 @@ def _is_armed(coin: str, side: str) -> bool:
     if ts is None:
         return False
     if WINDOW_SECONDS == 0:
-        return True  # no expiry -- stays armed until trend confirms
+        return True
     return time.time() - ts <= WINDOW_SECONDS
 
 
 def _arm(coin: str, side: str) -> bool:
-    """Arm or refresh. Returns True if this is a refresh."""
     if coin not in armed:
         armed[coin] = {"buy": None, "sell": None}
     was_armed = _is_armed(coin, side)
@@ -154,7 +159,7 @@ def _window_remaining(coin: str, side: str) -> int:
     if ts is None:
         return 0
     if WINDOW_SECONDS == 0:
-        return -1  # -1 = no expiry
+        return -1
     return max(0, int(WINDOW_SECONDS - (time.time() - ts)))
 
 
@@ -291,7 +296,6 @@ def trend_down():
 @app.route("/emergency-close", methods=["POST"])
 @limiter.limit("10 per minute")
 def emergency_close():
-    """Close ALL open positions to USDC, disarm all signals, apply cooldown."""
     data = request.get_json(silent=True) or {}
     if not verify_token(data):
         return jsonify({"error": "Unauthorized"}), 401
@@ -310,7 +314,7 @@ def emergency_close():
 
     for pos in positions:
         coin = pos.get("coin")
-        side = pos.get("side", "").lower()  # "long" or "short"
+        side = pos.get("side", "").lower()
         if not coin:
             continue
         try:
@@ -324,12 +328,10 @@ def emergency_close():
             logger.error(f"Emergency close: failed to close {coin} {side}: {e}")
             errors[coin] = str(e)
 
-    # Disarm all signals
     with lock:
         for coin in armed:
             armed[coin] = {"buy": None, "sell": None}
 
-    # Apply cooldown -- at least 60s after an emergency close
     emergency_cooldown = max(COOLDOWN_SECONDS, 60)
     for coin in results:
         cooldown_until[coin] = time.time() + emergency_cooldown
@@ -349,7 +351,6 @@ def emergency_close():
 @app.route("/reset", methods=["POST"])
 @limiter.limit("10 per minute")
 def reset_signals():
-    """Disarm all armed signals. Positions and trailing stop are NOT affected."""
     data = request.get_json(silent=True) or {}
     if not verify_token(data):
         return jsonify({"error": "Unauthorized"}), 401
@@ -401,12 +402,14 @@ def status():
         if ts > now
     }
     return jsonify({
-        "coins":            out,
-        "cooldowns":        cooldowns,
-        "window_seconds":   WINDOW_SECONDS,
-        "sell_mode":        SELL_MODE,
-        "sell_pct":         SELL_PCT,
-        "cooldown_seconds": COOLDOWN_SECONDS,
+        "coins":              out,
+        "cooldowns":          cooldowns,
+        "window_seconds":     WINDOW_SECONDS,
+        "sell_mode":          SELL_MODE,
+        "sell_pct":           SELL_PCT,
+        "cooldown_seconds":   COOLDOWN_SECONDS,
+        "rearm_after_stop":   REARM_AFTER_STOP,
+        "rearm_delay_seconds": REARM_DELAY_SECONDS,
     })
 
 

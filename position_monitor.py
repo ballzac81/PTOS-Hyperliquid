@@ -27,16 +27,30 @@ logger = logging.getLogger(__name__)
 
 
 class PositionMonitor:
-    def __init__(self, trader, notifier, cooldown_until: dict = None, cooldown_seconds: int = 0):
+    def __init__(self, trader, notifier, cooldown_until: dict = None, cooldown_seconds: int = 0,
+                 armed: dict = None, armed_lock=None,
+                 rearm_after_stop: bool = False, rearm_delay_seconds: int = 3600):
         self.trader   = trader
         self.notifier = notifier
         self.trail_pct = float(os.environ.get("TRAILING_STOP_PCT", "0.05"))
         self.interval  = int(os.environ.get("MONITOR_INTERVAL_SECONDS", "30"))
 
+        # best[(coin, side)] = best price seen since position first detected
         self._best: dict = {}
+
+        # Native resting stop orders on HL: (coin, side) -> HL order ID
         self._stop_orders: dict = {}
+
         self._cooldown_until   = cooldown_until
         self._cooldown_seconds = cooldown_seconds
+
+        # Re-arm after stop-out -- shared refs from signal_tracker
+        self._armed               = armed
+        self._armed_lock          = armed_lock
+        self._rearm_after_stop    = rearm_after_stop
+        self._rearm_delay_seconds = rearm_delay_seconds
+
+        # Tracks coins currently being closed to prevent double-close race condition
         self._closing: set = set()
         self._stop         = threading.Event()
 
@@ -120,7 +134,6 @@ class PositionMonitor:
                 logger.warning(f"[{coin}] Could not fetch price: {e}")
                 continue
 
-            # First time we see this position -- initialise and place native stop
             if key not in self._best:
                 self._best[key] = price
                 stop_px = (
@@ -132,7 +145,6 @@ class PositionMonitor:
                     f"ref={price:.4f} | "
                     f"stop={'below' if side == 'long' else 'above'} {stop_px:.4f}"
                 )
-                # Cancel any orphaned stop orders left from a previous container run
                 orphans = self.trader.get_open_stop_orders(coin)
                 for orphan_oid in orphans:
                     try:
@@ -145,7 +157,6 @@ class PositionMonitor:
                     self._stop_orders[key] = oid
                 continue
 
-            # Check for new peak -- update native stop if so
             new_peak = False
             if side == "long" and price > self._best[key]:
                 self._best[key] = price
@@ -164,11 +175,9 @@ class PositionMonitor:
             if new_peak:
                 self._update_native_stop(coin, side, stop_px, size)
 
-            # Polling backstop -- catches wicks the native stop may have missed
             if (side == "long" and price <= stop_px) or (side == "short" and price >= stop_px):
                 self._trigger(coin, side, price, self._best[key], stop_px)
 
-        # Clean up tracking for positions that no longer exist
         for key in list(self._best.keys()):
             if key not in active_keys and key not in self._closing:
                 coin, side = key
@@ -207,10 +216,38 @@ class PositionMonitor:
             if self._cooldown_until is not None and self._cooldown_seconds > 0:
                 self._cooldown_until[coin] = time.time() + self._cooldown_seconds
                 logger.info(f"[{coin}] Cooldown set for {self._cooldown_seconds}s")
+
             self.notifier.send(
                 f"[{coin}] {side.capitalize()} closed -- back to idle\n"
                 f"Result: {result}"
             )
+
+            # Auto re-arm if enabled -- schedules a delayed re-arm of the same direction
+            if self._rearm_after_stop and self._armed is not None and self._armed_lock is not None:
+                rearm_side  = "buy" if side == "long" else "sell"
+                delay       = self._rearm_delay_seconds
+                waiting_for = "trend-up" if rearm_side == "buy" else "trend-down"
+
+                def _do_rearm(c=coin, s=rearm_side, d=delay, wf=waiting_for):
+                    time.sleep(d)
+                    with self._armed_lock:
+                        if c not in self._armed:
+                            self._armed[c] = {"buy": None, "sell": None}
+                        self._armed[c][s] = time.time()
+                    logger.info(
+                        f"[{c}] Auto re-armed {s} signal after stop-out "
+                        f"(delay={d}s) -- waiting for {wf}"
+                    )
+                    self.notifier.send(
+                        f"[{c}] Auto re-armed after stop-out -- waiting for {wf}\n"
+                        f"(Signal expires in {self._rearm_delay_seconds}s if no confirmation)"
+                    )
+
+                threading.Thread(target=_do_rearm, daemon=True).start()
+                logger.info(
+                    f"[{coin}] Re-arm scheduled in {delay}s (REARM_AFTER_STOP=true)"
+                )
+
         except Exception as e:
             logger.error(f"[{coin}] Failed to close {side} on trailing stop: {e}")
             self.notifier.send(f"[{coin}] Trailing stop FAILED to close {side}: {e}")
