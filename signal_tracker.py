@@ -202,31 +202,34 @@ def trend_up():
             return jsonify({"status": "skip", "message": f"No active buy signal for {coin}"}), 200
         _disarm(coin, "buy")
 
-    if COOLDOWN_SECONDS > 0 and time.time() < cooldown_until.get(coin, 0):
-        remaining = int(cooldown_until[coin] - time.time())
-        logger.info(f"[{coin}] Trend-up ignored -- cooldown active ({remaining}s remaining)")
-        notifier.send(f"[{coin}] Trend-up ignored -- cooldown active ({remaining}s remaining)")
-        return jsonify({"status": "cooldown", "coin": coin, "cooldown_remaining_s": remaining}), 200
+    def _execute_long(c=coin):
+        if COOLDOWN_SECONDS > 0 and time.time() < cooldown_until.get(c, 0):
+            remaining = int(cooldown_until[c] - time.time())
+            logger.info(f"[{c}] Trend-up ignored -- cooldown active ({remaining}s remaining)")
+            notifier.send(f"[{c}] Trend-up ignored -- cooldown active ({remaining}s remaining)")
+            return
+        try:
+            positions = trader.get_positions()
+            has_short = any(p["coin"] == c and p["side"] == "short" for p in positions)
+            if has_short:
+                logger.info(f"[{c}] Trend UP confirmed -- flipping SHORT to LONG")
+                notifier.send(f"[{c}] Trend up! Closing SHORT and opening LONG...")
+                result = trader.flip_to_long(c)
+                action = "flip_to_long"
+            else:
+                logger.info(f"[{c}] Trend UP confirmed -- executing LONG")
+                notifier.send(f"[{c}] Trend up! Opening LONG on Hyperliquid...")
+                result = trader.open_long(c)
+                action = "open_long"
+            if COOLDOWN_SECONDS > 0:
+                cooldown_until[c] = time.time() + COOLDOWN_SECONDS
+            notifier.send(f"[{c}] ✅ Trade confirmed: {action} | {result}")
+        except Exception as e:
+            logger.error(f"[{c}] Background trade execution failed: {e}")
+            notifier.send(f"[{c}] ❌ Trade FAILED: {e}")
 
-    # Check if a short is already open -- if so, flip to long
-    positions = trader.get_positions()
-    has_short = any(p["coin"] == coin and p["side"] == "short" for p in positions)
-
-    if has_short:
-        logger.info(f"[{coin}] Trend UP confirmed -- flipping SHORT to LONG")
-        notifier.send(f"[{coin}] Trend up! Closing SHORT and opening LONG...")
-        result = trader.flip_to_long(coin)
-        action = "flip_to_long"
-    else:
-        logger.info(f"[{coin}] Trend UP confirmed -- executing LONG")
-        notifier.send(f"[{coin}] Trend up! Opening LONG on Hyperliquid...")
-        result = trader.open_long(coin)
-        action = "open_long"
-
-    if COOLDOWN_SECONDS > 0:
-        cooldown_until[coin] = time.time() + COOLDOWN_SECONDS
-    notifier.send(f"[{coin}] Trade executed: {result}")
-    return jsonify({"status": "trade_executed", "action": action, "coin": coin, "result": result})
+    threading.Thread(target=_execute_long, daemon=True).start()
+    return jsonify({"status": "acknowledged", "coin": coin, "message": "Trade queued -- watch Telegram for confirmation"}), 202
 
 
 # -- SELL flow ----------------------------------------------------------------
@@ -271,33 +274,38 @@ def trend_down():
             return jsonify({"status": "skip", "message": f"No active sell signal for {coin}"}), 200
         _disarm(coin, "sell")
 
-    if COOLDOWN_SECONDS > 0 and time.time() < cooldown_until.get(coin, 0):
-        remaining = int(cooldown_until[coin] - time.time())
-        logger.info(f"[{coin}] Trend-down ignored -- cooldown active ({remaining}s remaining)")
-        notifier.send(f"[{coin}] Trend-down ignored -- cooldown active ({remaining}s remaining)")
-        return jsonify({"status": "cooldown", "coin": coin, "cooldown_remaining_s": remaining}), 200
+    def _execute_short(c=coin):
+        if COOLDOWN_SECONDS > 0 and time.time() < cooldown_until.get(c, 0):
+            remaining = int(cooldown_until[c] - time.time())
+            logger.info(f"[{c}] Trend-down ignored -- cooldown active ({remaining}s remaining)")
+            notifier.send(f"[{c}] Trend-down ignored -- cooldown active ({remaining}s remaining)")
+            return
+        try:
+            if SELL_MODE == "short":
+                logger.info(f"[{c}] Trend DOWN confirmed -- flipping to SHORT")
+                notifier.send(f"[{c}] Trend down! Closing long and opening SHORT...")
+                result = trader.flip_to_short(c)
+                action = "flip_to_short"
+            elif SELL_MODE == "open_short":
+                logger.info(f"[{c}] Trend DOWN confirmed -- opening SHORT")
+                notifier.send(f"[{c}] Trend down! Opening SHORT...")
+                result = trader.open_short(c)
+                action = "open_short"
+            else:
+                pct_label = f"{int(SELL_PCT * 100)}%"
+                logger.info(f"[{c}] Trend DOWN confirmed -- closing {pct_label} of long")
+                notifier.send(f"[{c}] Trend down! Closing {pct_label} long...")
+                result = trader.close_long(c, pct=SELL_PCT)
+                action = f"close_long_{pct_label}"
+            if COOLDOWN_SECONDS > 0:
+                cooldown_until[c] = time.time() + COOLDOWN_SECONDS
+            notifier.send(f"[{c}] ✅ Trade confirmed: {action} | {result}")
+        except Exception as e:
+            logger.error(f"[{c}] Background trade execution failed: {e}")
+            notifier.send(f"[{c}] ❌ Trade FAILED: {e}")
 
-    if SELL_MODE == "short":
-        logger.info(f"[{coin}] Trend DOWN confirmed -- flipping to SHORT")
-        notifier.send(f"[{coin}] Trend down! Closing long and opening SHORT...")
-        result = trader.flip_to_short(coin)
-        action = "flip_to_short"
-    elif SELL_MODE == "open_short":
-        logger.info(f"[{coin}] Trend DOWN confirmed -- opening SHORT")
-        notifier.send(f"[{coin}] Trend down! Opening SHORT...")
-        result = trader.open_short(coin)
-        action = "open_short"
-    else:
-        pct_label = f"{int(SELL_PCT * 100)}%"
-        logger.info(f"[{coin}] Trend DOWN confirmed -- closing {pct_label} of long")
-        notifier.send(f"[{coin}] Trend down! Closing {pct_label} long...")
-        result = trader.close_long(coin, pct=SELL_PCT)
-        action = f"close_long_{pct_label}"
-
-    if COOLDOWN_SECONDS > 0:
-        cooldown_until[coin] = time.time() + COOLDOWN_SECONDS
-    notifier.send(f"[{coin}] Trade executed: {result}")
-    return jsonify({"status": "trade_executed", "action": action, "coin": coin, "result": result})
+    threading.Thread(target=_execute_short, daemon=True).start()
+    return jsonify({"status": "acknowledged", "coin": coin, "message": "Trade queued -- watch Telegram for confirmation"}), 202
 
 
 # -- Manual overrides ---------------------------------------------------------
@@ -419,6 +427,28 @@ def status():
         "cooldown_seconds":    COOLDOWN_SECONDS,
         "rearm_after_stop":    REARM_AFTER_STOP,
         "rearm_delay_seconds": REARM_DELAY_SECONDS,
+    })
+
+
+@app.route("/positions", methods=["GET"])
+def positions():
+    try:
+        return jsonify({"positions": trader.get_positions()})
+    except Exception as e:
+        logger.error(f"Failed to fetch positions: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok"})
+
+
+# -- Entrypoint (dev only -- Gunicorn ignores this) ---------------------------
+if __name__ == "__main__":
+    logger.info("PTOS Signal Tracker (Hyperliquid) starting in dev mode...")
+    app.run(host="0.0.0.0", port=5000, debug=False)
+ds": REARM_DELAY_SECONDS,
     })
 
 
