@@ -16,6 +16,11 @@ false entries.
 - **No signal expiry** -- signals stay armed until trend confirms (configurable)
 - **Independent per-coin tracking** -- SOL and BTC sequences never interfere
 - **Dual-layer trailing stop** -- native resting stop on HL (survives container downtime) + polling backstop
+- **Per-coin trailing stop override** -- set a different trailing stop % per coin (e.g. HYPE wider than BTC)
+- **Stop loss from entry** -- hard exit if price drops X% from your entry price (catches fakeouts before trailing stop moves)
+- **Max hold time** -- auto-close any position after N seconds regardless of price
+- **Flip detection** -- if a short is open when a buy confirms, closes the short and opens a long in one step (and vice versa)
+- **Async trade execution** -- webhooks return 202 immediately; trade executes in background with Telegram confirmation
 - **Cooldown after close** -- prevents whipsaw re-entries after a stop or exit
 - **Position size safety cap** -- hard ceiling on notional exposure per trade
 - **SELL_MODE toggle** -- flip to short, exit to USDC, or open short alongside long -- your choice
@@ -33,7 +38,8 @@ false entries.
 ```
 /buy-signal   <- your buy indicator fires (repeats refresh the window)
      |  bot armed, waiting...
-/trend-up     <- trend confirms upward -> LONG opened
+/trend-up     <- trend confirms upward -> LONG opened (or SHORT flipped to LONG)
+                 returns 202 immediately -- watch Telegram for trade confirmation
 ```
 
 **Sell flow:**
@@ -41,7 +47,12 @@ false entries.
 /sell-signal  <- your sell indicator fires (repeats refresh the window)
      |  bot armed, waiting...
 /trend-down   <- trend confirms downward -> long closed / short opened
+                 returns 202 immediately -- watch Telegram for trade confirmation
 ```
+
+> `/trend-up` and `/trend-down` execute trades asynchronously to avoid TradingView
+> webhook timeouts. The endpoint returns `202 Accepted` instantly; the trade runs in
+> the background and Telegram sends a confirmation (or error) when complete.
 
 ### Trailing stop (dual-layer)
 
@@ -104,7 +115,7 @@ curl -X POST http://YOUR_IP:5001/reset \
 |---------------|--------|------------------------------------|
 | `/status`     | GET    | Armed state, cooldowns, config     |
 | `/positions`  | GET    | Live Hyperliquid positions         |
-| `/health`     | GET    | Health check (used by Docker)      |
+| `/health`     | GET    | HL connectivity + equity check (used by Docker). Returns `{"status":"ok","hl_connected":true,"equity_usdc":123.45}` or `503` if HL unreachable |
 
 ---
 
@@ -151,12 +162,48 @@ cp .env.example .env
 | Setting                    | Default | Description                                           |
 |----------------------------|---------|-------------------------------------------------------|
 | `TRAILING_STOP_PCT`        | `0.05`  | Close if price pulls back this % from peak (0 = off)  |
+| `{COIN}_TRAILING_STOP_PCT` | —       | Per-coin override (e.g. `HYPE_TRAILING_STOP_PCT=0.07`)|
 | `MONITOR_INTERVAL_SECONDS` | `30`    | Polling backstop check interval (seconds)             |
 | `REARM_AFTER_STOP`         | `false` | Auto re-arm signal after stop-out (see below)         |
 | `REARM_DELAY_SECONDS`      | `3600`  | Seconds to wait before re-arming (default 1 hour)     |
 
 The trailing stop places a native reduce-only order on HL and updates it as
 the peak moves. Set `TRAILING_STOP_PCT=0` to disable both layers entirely.
+
+Per-coin overrides let volatile coins use a wider stop without affecting others:
+```
+# .env
+TRAILING_STOP_PCT=0.05        # default for all coins
+HYPE_TRAILING_STOP_PCT=0.08   # HYPE gets a wider stop
+BTC_TRAILING_STOP_PCT=0.03    # BTC gets a tighter stop
+```
+
+### Stop loss from entry
+
+| Setting          | Default | Description                                                     |
+|------------------|---------|-----------------------------------------------------------------|
+| `STOP_LOSS_PCT`  | `0`     | Close if price drops this % from entry price (0 = disabled)    |
+
+Fires on immediate losing trades before the trailing stop has moved far enough
+to protect you. Good for catching fakeout signals.
+
+Example: enter long at $100 with `STOP_LOSS_PCT=0.05` → exits at $95 regardless
+of where the trailing stop peak is.
+
+### Max hold time
+
+| Setting            | Default | Description                                                   |
+|--------------------|---------|---------------------------------------------------------------|
+| `MAX_HOLD_SECONDS` | `0`     | Auto-close position after this many seconds (0 = disabled)   |
+
+Useful when you don't want to hold a short over a weekend or a long through
+a major scheduled event.
+
+| Duration  | `MAX_HOLD_SECONDS` |
+|-----------|--------------------|
+| 1 day     | `86400`            |
+| 3 days    | `259200`           |
+| 7 days    | `604800`           |
 
 #### Re-arm after stop-out (`REARM_AFTER_STOP`)
 
