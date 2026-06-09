@@ -18,7 +18,7 @@ false entries.
 - **Dual-layer trailing stop** -- native resting stop on HL (survives container downtime) + polling backstop
 - **Cooldown after close** -- prevents whipsaw re-entries after a stop or exit
 - **Position size safety cap** -- hard ceiling on notional exposure per trade
-- **SELL_MODE toggle** -- flip to short, exit to USDC, or pyramid -- your choice
+- **SELL_MODE toggle** -- flip to short, exit to USDC, or open short alongside long -- your choice
 - **Manual overrides** -- `/emergency-close` and `/reset` endpoints for instant control
 - **Retry logic** -- all Hyperliquid API calls retry up to 3x with back-off
 - **Rate limiting** -- webhook endpoints capped at 30 req/min per IP
