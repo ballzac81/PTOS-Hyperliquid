@@ -441,29 +441,20 @@ def positions():
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok"})
-
-
-# -- Entrypoint (dev only -- Gunicorn ignores this) ---------------------------
-if __name__ == "__main__":
-    logger.info("PTOS Signal Tracker (Hyperliquid) starting in dev mode...")
-    app.run(host="0.0.0.0", port=5000, debug=False)
-ds": REARM_DELAY_SECONDS,
-    })
-
-
-@app.route("/positions", methods=["GET"])
-def positions():
     try:
-        return jsonify({"positions": trader.get_positions()})
+        equity = trader._equity()
+        return jsonify({
+            "status":       "ok",
+            "hl_connected": True,
+            "equity_usdc":  round(equity, 2),
+        })
     except Exception as e:
-        logger.error(f"Failed to fetch positions: {e}")
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"status": "ok"})
+        logger.warning(f"Health check: HL API unreachable: {e}")
+        return jsonify({
+            "status":       "degraded",
+            "hl_connected": False,
+            "error":        str(e),
+        }), 503
 
 
 # -- Entrypoint (dev only -- Gunicorn ignores this) ---------------------------
