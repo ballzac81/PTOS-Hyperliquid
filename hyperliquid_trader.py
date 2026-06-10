@@ -332,6 +332,19 @@ class HyperliquidTrader:
             })
         return positions
 
+    def get_fills(self, limit: int = 200) -> list:
+        """
+        Return recent trade fills from Hyperliquid, newest first.
+        Each fill has: time, coin, side, px, sz, closedPnl, fee, dir
+        """
+        try:
+            fills = self.info.user_fills(self.address)
+            fills = sorted(fills, key=lambda f: f.get("time", 0), reverse=True)
+            return fills[:limit]
+        except Exception as e:
+            logger.error(f"get_fills failed: {e}")
+            return []
+
     @staticmethod
     def _format_result(result) -> str:
         if isinstance(result, dict):
