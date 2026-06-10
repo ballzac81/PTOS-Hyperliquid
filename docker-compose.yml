@@ -10,6 +10,8 @@ services:
       - "5001:5000"
     env_file:
       - .env
+    volumes:
+      - /mnt/user/appdata/ptos/data:/app/data
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
       interval: 30s

@@ -16,7 +16,7 @@ Manual overrides (require X-Webhook-Secret header or token in JSON body):
 
   GET  /status           Current armed state per coin
   GET  /positions        Live Hyperliquid positions
-  GET  /trades           Recent trade fill history
+  GET  /trades           Bot trade log (only trades PTOS executed)
   GET  /health           Health check
   GET  /dashboard        Web dashboard
 """
@@ -24,6 +24,7 @@ Manual overrides (require X-Webhook-Secret header or token in JSON body):
 import os
 import sys
 import time
+import json
 import signal
 import logging
 import threading
@@ -41,6 +42,43 @@ SELL_MODE            = os.environ.get("SELL_MODE", "short")
 SELL_PCT             = float(os.environ.get("SELL_PCT", "1.0"))
 REARM_AFTER_STOP     = os.environ.get("REARM_AFTER_STOP", "false").lower() == "true"
 REARM_DELAY_SECONDS  = int(os.environ.get("REARM_DELAY_SECONDS", "3600"))
+
+# -- Trade log ----------------------------------------------------------------
+TRADE_LOG_FILE = "/app/data/ptos_trades.json"
+_trade_log: list = []
+_trade_log_lock = threading.Lock()
+
+def _load_trade_log():
+    global _trade_log
+    try:
+        os.makedirs(os.path.dirname(TRADE_LOG_FILE), exist_ok=True)
+        if os.path.exists(TRADE_LOG_FILE):
+            with open(TRADE_LOG_FILE, "r") as f:
+                _trade_log = json.load(f)
+            logging.getLogger(__name__).info(f"Trade log loaded: {len(_trade_log)} entries")
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"Could not load trade log: {e}")
+        _trade_log = []
+
+def _save_trade_log():
+    try:
+        with open(TRADE_LOG_FILE, "w") as f:
+            json.dump(_trade_log, f)
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"Could not save trade log: {e}")
+
+def _log_trade(coin: str, action: str, result: str):
+    entry = {
+        "time":   int(time.time() * 1000),
+        "coin":   coin,
+        "action": action,
+        "result": result,
+    }
+    with _trade_log_lock:
+        _trade_log.insert(0, entry)
+        _save_trade_log()
+
+_load_trade_log()
 
 # -- Startup validation -------------------------------------------------------
 if SELL_MODE not in ("short", "close_long", "open_short"):
@@ -166,10 +204,10 @@ tr:hover td { background: rgba(255,255,255,0.02); }
 .pnl-zero { color: var(--muted); }
 .side-long { color: var(--green); font-weight: 600; }
 .side-short { color: var(--red); font-weight: 600; }
-.dir-open-long, .dir-buy { color: var(--green); }
-.dir-open-short, .dir-sell { color: var(--red); }
-.dir-close-long { color: var(--muted); }
-.dir-close-short { color: var(--muted); }
+.act-long { color: var(--green); }
+.act-short { color: var(--red); }
+.act-close { color: var(--muted); }
+.result-cell { color: var(--muted); font-size: 11px; max-width: 420px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 </style>
 </head>
 <body>
@@ -201,8 +239,8 @@ tr:hover td { background: rgba(255,255,255,0.02); }
       <div class="card-value" id="unrealized-pnl">—</div>
     </div>
     <div class="card">
-      <div class="card-label">Realized PnL (all)</div>
-      <div class="card-value" id="total-pnl">—</div>
+      <div class="card-label">Bot Trades</div>
+      <div class="card-value blue" id="trade-total">—</div>
     </div>
   </div>
 
@@ -224,15 +262,14 @@ tr:hover td { background: rgba(255,255,255,0.02); }
 
   <div class="section">
     <div class="section-header">
-      <span>Trade History</span>
+      <span>Bot Trade Log</span>
       <span id="trade-count" style="color:var(--muted);font-size:11px;"></span>
     </div>
     <table>
       <thead><tr>
-        <th>Time</th><th>Coin</th><th>Direction</th><th>Fill Price</th>
-        <th>Size</th><th>Realized PnL</th><th>Fee</th><th>Net PnL</th>
+        <th>Time</th><th>Coin</th><th>Action</th><th>Fill Details</th>
       </tr></thead>
-      <tbody id="trades-body"><tr><td colspan="8" class="empty">Loading...</td></tr></tbody>
+      <tbody id="trades-body"><tr><td colspan="4" class="empty">Loading...</td></tr></tbody>
     </table>
   </div>
 </div>
@@ -247,10 +284,10 @@ function fmt(n, dec) {
   return Number(n).toLocaleString('en-US', {minimumFractionDigits: dec, maximumFractionDigits: dec});
 }
 
-function fmtUsd(n, dec) {
+function fmtUsd(n) {
   var v = Number(n);
   if (isNaN(v)) return '—';
-  return '$' + fmt(v, dec === undefined ? 2 : dec);
+  return '$' + fmt(v);
 }
 
 function fmtPnl(n) {
@@ -272,19 +309,24 @@ function fmtTime(ms) {
   return dd + '/' + mm + ' ' + hh + ':' + mi + ':' + ss;
 }
 
-function dirClass(dir) {
-  if (!dir) return '';
-  var d = dir.toLowerCase();
-  if (d.indexOf('open long') >= 0 || d === 'buy') return 'dir-open-long';
-  if (d.indexOf('open short') >= 0 || d === 'sell') return 'dir-open-short';
-  if (d.indexOf('close long') >= 0) return 'dir-close-long';
-  if (d.indexOf('close short') >= 0) return 'dir-close-short';
-  return '';
+function actionClass(action) {
+  if (!action) return '';
+  var a = action.toLowerCase();
+  if (a === 'open_long' || a === 'flip_to_long') return 'act-long';
+  if (a === 'open_short' || a === 'flip_to_short') return 'act-short';
+  return 'act-close';
 }
 
-function isClose(dir) {
-  if (!dir) return false;
-  return dir.toLowerCase().indexOf('close') >= 0;
+function actionLabel(action) {
+  var map = {
+    'open_long':    'Open Long',
+    'flip_to_long': 'Flip → Long',
+    'open_short':   'Open Short',
+    'flip_to_short':'Flip → Short',
+  };
+  if (map[action]) return map[action];
+  if (action && action.indexOf('close_long') >= 0) return action.replace('close_long_', 'Close Long ');
+  return action || '—';
 }
 
 async function loadHealth() {
@@ -370,37 +412,25 @@ async function loadPositions() {
 
 async function loadTrades() {
   try {
-    var r = await fetch('/trades?limit=200');
+    var r = await fetch('/trades');
     var d = await r.json();
-    var fills = d.fills || [];
+    var trades = d.trades || [];
     var tbody = document.getElementById('trades-body');
-    if (fills.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="8" class="empty">No trade history</td></tr>';
-      document.getElementById('total-pnl').textContent = '—';
+    document.getElementById('trade-total').textContent = trades.length;
+    if (trades.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="4" class="empty">No bot trades recorded yet</td></tr>';
+      document.getElementById('trade-count').textContent = '';
       return;
     }
-    var totalPnl = 0;
-    fills.forEach(function(f) { totalPnl += parseFloat(f.closedPnl || 0); });
-    var pnlEl = document.getElementById('total-pnl');
-    pnlEl.innerHTML = fmtPnl(totalPnl);
-    pnlEl.className = 'card-value';
-    document.getElementById('trade-count').textContent = fills.length + ' fills';
-    tbody.innerHTML = fills.map(function(f) {
-      var pnl = parseFloat(f.closedPnl || 0);
-      var fee = parseFloat(f.fee || 0);
-      var net = pnl - fee;
-      var dir = f.dir || (f.side === 'B' ? 'Buy' : 'Sell');
-      var close = isClose(dir);
-      var dCls = dirClass(dir);
+    document.getElementById('trade-count').textContent = trades.length + ' trades';
+    tbody.innerHTML = trades.map(function(t) {
+      var aCls = actionClass(t.action);
+      var aLbl = actionLabel(t.action);
       return '<tr>' +
-             '<td style="white-space:nowrap;color:var(--muted)">' + fmtTime(f.time) + '</td>' +
-             '<td><strong>' + f.coin + '</strong></td>' +
-             '<td class="' + dCls + '">' + dir + '</td>' +
-             '<td>' + fmtUsd(parseFloat(f.px)) + '</td>' +
-             '<td>' + fmt(parseFloat(f.sz), 4) + '</td>' +
-             '<td>' + (close ? fmtPnl(pnl) : '<span class="muted">—</span>') + '</td>' +
-             '<td class="pnl-neg">-$' + fmt(Math.abs(fee)) + '</td>' +
-             '<td>' + (close ? fmtPnl(net) : '<span class="muted">—</span>') + '</td>' +
+             '<td style="white-space:nowrap;color:var(--muted)">' + fmtTime(t.time) + '</td>' +
+             '<td><strong>' + t.coin + '</strong></td>' +
+             '<td class="' + aCls + '">' + aLbl + '</td>' +
+             '<td class="result-cell" title="' + (t.result || '') + '">' + (t.result || '—') + '</td>' +
              '</tr>';
     }).join('');
   } catch(e) {}
@@ -546,6 +576,7 @@ def trend_up():
                 action = "open_long"
             if COOLDOWN_SECONDS > 0:
                 cooldown_until[c] = time.time() + COOLDOWN_SECONDS
+            _log_trade(c, action, result)
             notifier.send(f"[{c}] ✅ Trade confirmed: {action} | {result}")
         except Exception as e:
             logger.error(f"[{c}] Background trade execution failed: {e}")
@@ -622,6 +653,7 @@ def trend_down():
                 action = f"close_long_{pct_label}"
             if COOLDOWN_SECONDS > 0:
                 cooldown_until[c] = time.time() + COOLDOWN_SECONDS
+            _log_trade(c, action, result)
             notifier.send(f"[{c}] ✅ Trade confirmed: {action} | {result}")
         except Exception as e:
             logger.error(f"[{c}] Background trade execution failed: {e}")
@@ -659,9 +691,13 @@ def emergency_close():
             continue
         try:
             if side == "long":
-                results[coin] = trader.close_long(coin)
+                result = trader.close_long(coin)
+                results[coin] = result
+                _log_trade(coin, "emergency_close_long", result)
             elif side == "short":
-                results[coin] = trader.close_short(coin)
+                result = trader.close_short(coin)
+                results[coin] = result
+                _log_trade(coin, "emergency_close_short", result)
             else:
                 results[coin] = "skipped (unknown side)"
         except Exception as e:
@@ -764,13 +800,9 @@ def positions():
 
 @app.route("/trades", methods=["GET"])
 def trades():
-    try:
-        limit = min(int(request.args.get("limit", 200)), 500)
-        fills = trader.get_fills(limit=limit)
-        return jsonify({"fills": fills, "count": len(fills)})
-    except Exception as e:
-        logger.error(f"Failed to fetch trade history: {e}")
-        return jsonify({"error": str(e)}), 500
+    with _trade_log_lock:
+        log = list(_trade_log)
+    return jsonify({"trades": log, "count": len(log)})
 
 
 @app.route("/health", methods=["GET"])
