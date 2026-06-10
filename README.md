@@ -115,7 +115,9 @@ curl -X POST http://YOUR_IP:5001/reset \
 |---------------|--------|------------------------------------|
 | `/status`     | GET    | Armed state, cooldowns, config     |
 | `/positions`  | GET    | Live Hyperliquid positions         |
+| `/trades`     | GET    | Bot trade log (only trades PTOS executed, persisted across restarts) |
 | `/health`     | GET    | HL connectivity + equity check (used by Docker). Returns `{"status":"ok","hl_connected":true,"equity_usdc":123.45}` or `503` if HL unreachable |
+| `/dashboard`  | GET    | Web dashboard — equity, bot state, open positions, trade log |
 
 ---
 
@@ -416,6 +418,19 @@ Add separate TradingView alerts per coin. The bot tracks each coin independently
 
 ## Monitoring
 
+### Web dashboard
+
+Open in any browser — auto-refreshes every 30 seconds:
+
+```
+http://YOUR_IP:5001/dashboard
+```
+
+Shows equity, HL connectivity, bot armed state per coin, open positions with
+unrealized PnL, and a full log of every trade PTOS has executed.
+
+### CLI
+
 ```bash
 # Check signal state, cooldowns, and config
 curl http://localhost:5001/status
@@ -423,12 +438,22 @@ curl http://localhost:5001/status
 # Check open positions with PnL
 curl http://localhost:5001/positions
 
+# Bot trade log (JSON)
+curl http://localhost:5001/trades
+
 # Live logs
 docker compose logs -f
 ```
 
 The `/status` endpoint shows which coins are armed, window remaining,
 active cooldowns, and current config.
+
+### Trade log
+
+Every trade PTOS executes is written to `/mnt/user/appdata/ptos/data/ptos_trades.json`
+(via the volume mount in `docker-compose.yml`). This file persists across container
+rebuilds so trade history is never lost. Only trades the bot executed are logged —
+manual trades made directly on Hyperliquid are excluded.
 
 ---
 
