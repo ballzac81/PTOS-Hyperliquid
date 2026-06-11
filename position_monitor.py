@@ -39,7 +39,8 @@ MAX_HOLD_SECONDS = int(os.environ.get("MAX_HOLD_SECONDS", "0"))
 class PositionMonitor:
     def __init__(self, trader, notifier, cooldown_until: dict = None, cooldown_seconds: int = 0,
                  armed: dict = None, armed_lock=None,
-                 rearm_after_stop: bool = False, rearm_delay_seconds: int = 3600):
+                 rearm_after_stop: bool = False, rearm_delay_seconds: int = 3600,
+                 trade_log_callback=None):
         self.trader   = trader
         self.notifier = notifier
         self.trail_pct = float(os.environ.get("TRAILING_STOP_PCT", "0.05"))
@@ -63,6 +64,9 @@ class PositionMonitor:
         self._armed_lock          = armed_lock
         self._rearm_after_stop    = rearm_after_stop
         self._rearm_delay_seconds = rearm_delay_seconds
+
+        # Optional callback to log stop-triggered closes to the trade log
+        self._trade_log_callback = trade_log_callback
 
         # Tracks coins currently being closed to prevent double-close race condition
         self._closing: set = set()
@@ -251,14 +255,91 @@ class PositionMonitor:
                 self._trigger(coin, side, price, self._best[key], stop_px,
                               reason="trailing_stop")
 
+        # -- Detect positions closed externally (native stop, manual close) ---
         for key in list(self._best.keys()):
             if key not in active_keys and key not in self._closing:
                 coin, side = key
-                logger.info(f"[{coin}] {side} position gone -- removing from monitor")
+                logger.info(f"[{coin}] {side} position gone -- closed externally (stop order or manual)")
                 self._cancel_native_stop(coin, side)
+                self._notify_external_close(coin, side)
                 del self._best[key]
                 self._entry_price.pop(key, None)
                 self._entry_time.pop(key, None)
+
+    def _notify_external_close(self, coin: str, side: str):
+        """
+        Called when a tracked position disappears without _trigger() firing.
+        This means the native HL stop order executed, or the position was manually closed.
+        """
+        key = (coin, side)
+        ep  = self._entry_price.get(key)
+
+        # Try to get the close price from recent fills
+        close_price = None
+        pnl_pct     = None
+        try:
+            fills = self.trader.get_fills(limit=10)
+            for f in fills:
+                if f.get("coin") == coin:
+                    close_price = float(f.get("px", 0))
+                    break
+        except Exception:
+            pass
+
+        if ep and close_price:
+            pnl_pct = (
+                (close_price - ep) / ep * 100 if side == "long"
+                else (ep - close_price) / ep * 100
+            )
+
+        lines = [f"[{coin}] {side.capitalize()} closed (stop order or manual)"]
+        if ep:
+            lines.append(f"Entry: {ep:.4f}")
+        if close_price:
+            lines.append(
+                f"Close: {close_price:.4f}"
+                + (f" | PnL: {pnl_pct:+.1f}%" if pnl_pct is not None else "")
+            )
+
+        self.notifier.send("\n".join(lines))
+
+        if self._trade_log_callback is not None:
+            try:
+                result = (
+                    f"close_px={close_price:.4f} | pnl={pnl_pct:+.1f}%"
+                    if close_price and pnl_pct is not None
+                    else f"close_px={close_price:.4f}" if close_price
+                    else "close_px=unknown"
+                )
+                self._trade_log_callback(coin, f"native_stop_{side}", result)
+            except Exception:
+                pass
+
+        if self._cooldown_until is not None and self._cooldown_seconds > 0:
+            self._cooldown_until[coin] = time.time() + self._cooldown_seconds
+            logger.info(f"[{coin}] Cooldown set for {self._cooldown_seconds}s after external close")
+
+        if self._rearm_after_stop and self._armed is not None and self._armed_lock is not None:
+            rearm_side  = "buy" if side == "long" else "sell"
+            delay       = self._rearm_delay_seconds
+            waiting_for = "trend-up" if rearm_side == "buy" else "trend-down"
+
+            def _do_rearm(c=coin, s=rearm_side, d=delay, wf=waiting_for):
+                time.sleep(d)
+                with self._armed_lock:
+                    if c not in self._armed:
+                        self._armed[c] = {"buy": None, "sell": None}
+                    self._armed[c][s] = time.time()
+                logger.info(
+                    f"[{c}] Auto re-armed {s} signal after external close "
+                    f"(delay={d}s) -- waiting for {wf}"
+                )
+                self.notifier.send(
+                    f"[{c}] Auto re-armed after stop-out -- waiting for {wf}\n"
+                    f"(Signal expires in {self._rearm_delay_seconds}s if no confirmation)"
+                )
+
+            threading.Thread(target=_do_rearm, daemon=True).start()
 
     def _trigger(self, coin: str, side: str, price: float, best: float, stop_px: float,
                  reason: str = "trailing_stop"):
@@ -319,6 +400,13 @@ class PositionMonitor:
                 f"[{coin}] {side.capitalize()} closed -- back to idle\n"
                 f"Result: {result}"
             )
+
+            # Log to dashboard trade log
+            if self._trade_log_callback is not None:
+                try:
+                    self._trade_log_callback(coin, reason, result)
+                except Exception:
+                    pass
 
             # Auto re-arm if enabled
             if self._rearm_after_stop and self._armed is not None and self._armed_lock is not None:

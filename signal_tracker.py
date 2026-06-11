@@ -124,6 +124,7 @@ monitor = PositionMonitor(
     armed_lock=lock,
     rearm_after_stop=REARM_AFTER_STOP,
     rearm_delay_seconds=REARM_DELAY_SECONDS,
+    trade_log_callback=_log_trade,
 )
 monitor.start()
 
