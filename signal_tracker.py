@@ -42,9 +42,11 @@ SELL_MODE            = os.environ.get("SELL_MODE", "short")
 SELL_PCT             = float(os.environ.get("SELL_PCT", "1.0"))
 REARM_AFTER_STOP     = os.environ.get("REARM_AFTER_STOP", "false").lower() == "true"
 REARM_DELAY_SECONDS  = int(os.environ.get("REARM_DELAY_SECONDS", "3600"))
+HTF_FILTER_ENABLED   = os.environ.get("HTF_FILTER_ENABLED", "false").lower() == "true"
 
 # -- Trade log ----------------------------------------------------------------
-TRADE_LOG_FILE = "/app/data/ptos_trades.json"
+TRADE_LOG_FILE  = "/app/data/ptos_trades.json"
+HTF_BIAS_FILE   = "/app/data/ptos_htf_bias.json"
 _trade_log: list = []
 _trade_log_lock = threading.Lock()
 
@@ -80,6 +82,23 @@ def _log_trade(coin: str, action: str, result: str):
 
 _load_trade_log()
 
+def _load_htf_bias():
+    global htf_bias
+    try:
+        if os.path.exists(HTF_BIAS_FILE):
+            with open(HTF_BIAS_FILE, "r") as f:
+                htf_bias.update(json.load(f))
+            logging.getLogger(__name__).info(f"HTF bias loaded: {dict(htf_bias)}")
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"Could not load HTF bias: {e}")
+
+def _save_htf_bias():
+    try:
+        with open(HTF_BIAS_FILE, "w") as f:
+            json.dump(htf_bias, f)
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"Could not save HTF bias: {e}")
+
 # -- Startup validation -------------------------------------------------------
 if SELL_MODE not in ("short", "close_long", "open_short"):
     print(f"ERROR: Invalid SELL_MODE '{SELL_MODE}'. Must be: short, close_long, open_short", flush=True)
@@ -113,6 +132,8 @@ lock     = threading.Lock()
 armed: dict = {}
 COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "0"))
 cooldown_until: dict = {}
+htf_bias: dict = {}   # coin -> "bull" | "bear" | "neutral"
+_load_htf_bias()
 
 # Start trailing stop monitor
 monitor = PositionMonitor(
@@ -246,6 +267,14 @@ tr:hover td { background: rgba(255,255,255,0.02); }
   </div>
 
   <div class="section">
+    <div class="section-header">
+      <span>HTF Filter</span>
+      <span id="htf-filter-status" style="font-size:11px;"></span>
+    </div>
+    <div id="htf-state"><div class="empty">Loading...</div></div>
+  </div>
+
+  <div class="section">
     <div class="section-header"><span>Bot State</span></div>
     <div id="bot-state"><div class="empty">Loading...</div></div>
   </div>
@@ -353,19 +382,53 @@ async function loadStatus() {
     var r = await fetch('/status');
     var d = await r.json();
     var coins = d.coins || {};
-    var keys = Object.keys(coins);
+    var htf = d.htf_bias || {};
+    var filterOn = d.htf_filter_enabled || false;
+
+    // -- HTF Filter section --
+    var filterStatusEl = document.getElementById('htf-filter-status');
+    var htfEl = document.getElementById('htf-state');
+    filterStatusEl.innerHTML = filterOn
+      ? '<span class="green">● ACTIVE — trades filtered by HTF bias</span>'
+      : '<span class="muted">○ MONITORING ONLY — set HTF_FILTER_ENABLED=true to block trades</span>';
+
+    var htfCoins = Object.keys(htf);
+    if (htfCoins.length === 0) {
+      htfEl.innerHTML = '<div class="empty">No HTF bias set — POST /htf-trend to set</div>';
+    } else {
+      htfEl.innerHTML = htfCoins.map(function(coin) {
+        var bias = htf[coin];
+        return '<div class="coin-row"><span class="coin-name">' + coin + '</span>' +
+               renderHtfBadge(bias, filterOn) +
+               (filterOn && bias !== 'bull' ? ' <span class="badge-detail" style="color:var(--red)">longs blocked</span>' : '') +
+               (filterOn && bias !== 'bear' ? ' <span class="badge-detail" style="color:var(--red)">shorts blocked</span>' : '') +
+               '</div>';
+      }).join('');
+    }
+
+    // -- Bot State section --
+    var allCoins = Array.from(new Set(Object.keys(coins)));
     var el = document.getElementById('bot-state');
-    if (keys.length === 0) {
+    if (allCoins.length === 0) {
       el.innerHTML = '<div class="empty">No signals armed — bot idle</div>';
       return;
     }
-    el.innerHTML = keys.map(function(coin) {
-      var s = coins[coin];
+    el.innerHTML = allCoins.map(function(coin) {
+      var s = coins[coin] || {buy: 'idle', sell: 'idle'};
       return '<div class="coin-row"><span class="coin-name">' + coin + '</span>' +
              '<span>BUY: ' + renderBadge(s.buy, 'buy') + '</span>' +
              '<span>SELL: ' + renderBadge(s.sell, 'sell') + '</span></div>';
     }).join('');
   } catch(e) {}
+}
+
+function renderHtfBadge(bias, filterOn) {
+  if (!bias) return filterOn
+    ? '<span class="badge badge-sell">not set — trades blocked</span>'
+    : '<span class="badge badge-idle">not set</span>';
+  if (bias === 'bull') return '<span class="badge badge-buy">▲ BULL</span>';
+  if (bias === 'bear') return '<span class="badge badge-sell">▼ BEAR</span>';
+  return '<span class="badge badge-idle">◆ NEUTRAL</span>';
 }
 
 function renderBadge(state, side) {
@@ -557,6 +620,11 @@ def trend_up():
         _disarm(coin, "buy")
 
     def _execute_long(c=coin):
+        if HTF_FILTER_ENABLED and htf_bias.get(c) != "bull":
+            current = htf_bias.get(c, "not set")
+            logger.info(f"[{c}] Long blocked by HTF filter | htf_bias={current} (need: bull)")
+            notifier.send(f"[{c}] Long BLOCKED -- HTF bias is '{current}' (need bull)\nSet via /htf-trend to allow")
+            return
         if COOLDOWN_SECONDS > 0 and time.time() < cooldown_until.get(c, 0):
             remaining = int(cooldown_until[c] - time.time())
             logger.info(f"[{c}] Trend-up ignored -- cooldown active ({remaining}s remaining)")
@@ -630,6 +698,11 @@ def trend_down():
         _disarm(coin, "sell")
 
     def _execute_short(c=coin):
+        if HTF_FILTER_ENABLED and htf_bias.get(c) != "bear":
+            current = htf_bias.get(c, "not set")
+            logger.info(f"[{c}] Short blocked by HTF filter | htf_bias={current} (need: bear)")
+            notifier.send(f"[{c}] Short BLOCKED -- HTF bias is '{current}' (need bear)\nSet via /htf-trend to allow")
+            return
         if COOLDOWN_SECONDS > 0 and time.time() < cooldown_until.get(c, 0):
             remaining = int(cooldown_until[c] - time.time())
             logger.info(f"[{c}] Trend-down ignored -- cooldown active ({remaining}s remaining)")
@@ -662,6 +735,33 @@ def trend_down():
 
     threading.Thread(target=_execute_short, daemon=True).start()
     return jsonify({"status": "acknowledged", "coin": coin, "message": "Trade queued -- watch Telegram for confirmation"}), 202
+
+
+# -- HTF bias -----------------------------------------------------------------
+
+@app.route("/htf-trend", methods=["POST"])
+@limiter.limit("30 per minute")
+def htf_trend():
+    data = request.get_json(silent=True) or {}
+    if not verify_token(data):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    coin = normalize_coin(data.get("coin") or data.get("pair", "SOL"))
+    bias = data.get("bias", "").lower()
+
+    if bias not in ("bull", "bear", "neutral"):
+        return jsonify({"error": "bias must be 'bull', 'bear', or 'neutral'"}), 400
+
+    prev = htf_bias.get(coin, "not set")
+    htf_bias[coin] = bias
+    _save_htf_bias()
+    logger.info(f"[{coin}] HTF bias: {prev} -> {bias}")
+
+    label = "🟢 BULL" if bias == "bull" else "🔴 BEAR" if bias == "bear" else "⚪ NEUTRAL"
+    filter_note = " | filter ACTIVE" if HTF_FILTER_ENABLED else " | filter disabled (HTF_FILTER_ENABLED=false)"
+    notifier.send(f"[{coin}] HTF bias set: {label}{filter_note}")
+
+    return jsonify({"status": "ok", "coin": coin, "htf_bias": bias, "filter_enabled": HTF_FILTER_ENABLED})
 
 
 # -- Manual overrides ---------------------------------------------------------
@@ -781,6 +881,8 @@ def status():
     return jsonify({
         "coins":               out,
         "cooldowns":           cooldowns,
+        "htf_bias":            dict(htf_bias),
+        "htf_filter_enabled":  HTF_FILTER_ENABLED,
         "window_seconds":      WINDOW_SECONDS,
         "sell_mode":           SELL_MODE,
         "sell_pct":            SELL_PCT,
