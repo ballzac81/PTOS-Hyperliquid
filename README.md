@@ -21,13 +21,16 @@ false entries.
 - **Max hold time** -- auto-close any position after N seconds regardless of price
 - **Flip detection** -- if a short is open when a buy confirms, closes the short and opens a long in one step (and vice versa)
 - **Async trade execution** -- webhooks return 202 immediately; trade executes in background with Telegram confirmation
+- **Native stop notification** -- Telegram alert fires even when the HL native stop order closes the position before the polling loop runs; includes entry price, close price, and PnL%
+- **Full trade log** -- all closes (signal-triggered and stop-triggered) appear in the dashboard trade log
+- **HTF bias filter** -- anchor every trade to a higher timeframe trend; longs blocked unless HTF is bull, shorts blocked unless HTF is bear; bias persists across restarts
 - **Cooldown after close** -- prevents whipsaw re-entries after a stop or exit
 - **Position size safety cap** -- hard ceiling on notional exposure per trade
 - **SELL_MODE toggle** -- flip to short, exit to USDC, or open short alongside long -- your choice
 - **Manual overrides** -- `/emergency-close` and `/reset` endpoints for instant control
 - **Retry logic** -- all Hyperliquid API calls retry up to 3x with back-off
 - **Rate limiting** -- webhook endpoints capped at 30 req/min per IP
-- **Telegram notifications** -- every signal step and trade execution
+- **Telegram notifications** -- every signal step, trade execution, stop-out, and HTF bias change
 - **Single Docker container** -- no Freqtrade, no exchange API keys needed
 
 ---
@@ -89,6 +92,7 @@ immediate re-entry.
 | `/trend-up`     | POST   | Trend confirmed up -- open long                |
 | `/sell-signal`  | POST   | Arm sell watch (each fire refreshes the window)|
 | `/trend-down`   | POST   | Trend confirmed down -- sell / short           |
+| `/htf-trend`    | POST   | Set higher timeframe bias for a coin (`bull`, `bear`, or `neutral`) |
 
 ### Manual overrides
 
@@ -113,11 +117,11 @@ curl -X POST http://YOUR_IP:5001/reset \
 
 | Endpoint      | Method | Description                        |
 |---------------|--------|------------------------------------|
-| `/status`     | GET    | Armed state, cooldowns, config     |
-| `/positions`  | GET    | Live Hyperliquid positions         |
-| `/trades`     | GET    | Bot trade log (only trades PTOS executed, persisted across restarts) |
+| `/status`     | GET    | Armed state, cooldowns, HTF bias, and config   |
+| `/positions`  | GET    | Live Hyperliquid positions                     |
+| `/trades`     | GET    | Bot trade log -- all PTOS-executed closes (signal and stop-triggered), persisted across restarts |
 | `/health`     | GET    | HL connectivity + equity check (used by Docker). Returns `{"status":"ok","hl_connected":true,"equity_usdc":123.45}` or `503` if HL unreachable |
-| `/dashboard`  | GET    | Web dashboard — equity, bot state, open positions, trade log |
+| `/dashboard`  | GET    | Web dashboard — equity, HTF filter status, bot state, open positions, trade log |
 
 ---
 
@@ -234,6 +238,40 @@ Trailing stop fires → long closed
 > **Note:** On lower timeframes (30m), a wider `TRAILING_STOP_PCT` is usually
 > safer than enabling re-arm. Re-arm is better suited to 4h+ charts where
 > trends are cleaner and fakeouts are rarer.
+
+### HTF bias filter
+
+| Setting              | Default | Description                                                        |
+|----------------------|---------|--------------------------------------------------------------------|
+| `HTF_FILTER_ENABLED` | `false` | `true` = block trades that don't match the HTF bias               |
+
+When enabled, the bot checks the stored HTF bias for a coin before executing:
+- Longs are blocked unless `htf_bias[coin] == "bull"`
+- Shorts are blocked unless `htf_bias[coin] == "bear"`
+- If no bias has been set for a coin, all trades for that coin are blocked
+
+If a trade is blocked, a Telegram message explains why and the signal is discarded.
+
+**Setting the bias** -- POST to `/htf-trend` from a TradingView alert on a higher timeframe chart:
+
+```json
+{"coin": "HYPE", "token": "YOUR_SECRET_TOKEN", "bias": "bull"}
+```
+
+Valid values for `bias`: `bull` | `bear` | `neutral`
+
+The bias is **persisted to disk** (`/app/data/ptos_htf_bias.json`) and survives container restarts. Set it once and it stays until you update it.
+
+**Typical TradingView setup:** create two alerts on your daily/weekly chart (e.g. your optimised trend indicator, or a 200 EMA cross). One fires when the trend turns bullish, one when it turns bearish.
+
+| Alert               | Webhook URL          | Body                                                              |
+|---------------------|----------------------|-------------------------------------------------------------------|
+| HTF turns bullish   | `/htf-trend`         | `{"coin": "HYPE", "token": "...", "bias": "bull"}`               |
+| HTF turns bearish   | `/htf-trend`         | `{"coin": "HYPE", "token": "...", "bias": "bear"}`               |
+
+The dashboard shows a dedicated **HTF Filter** section with the current bias per coin and whether the filter is active or in monitoring-only mode.
+
+> **Leave `HTF_FILTER_ENABLED=false`** while testing to see the bias displayed on the dashboard without it blocking any trades.
 
 ### Cooldown & safety
 
@@ -360,7 +398,7 @@ curl http://localhost:5001/positions
 
 ### 4. Set up TradingView alerts
 
-Create **4 alerts** on your chart. Same JSON body for all, different URL each.
+Create **4 alerts** on your trading timeframe chart. Same JSON body for all, different URL each.
 
 **Message body:**
 ```json
@@ -378,6 +416,17 @@ Set alert trigger to **"Once per bar close"**.
 
 > Hyperliquid uses coin symbols: `"SOL"`, `"BTC"`, `"ETH"`.
 > `"SOL/USD"` and `"SOL/USDC"` are also accepted and stripped automatically.
+
+**Optional: HTF alerts (recommended)**
+
+On a higher timeframe chart (daily or weekly), create 2 more alerts to set the bias:
+
+| Alert               | Webhook URL                        | Body                                                    |
+|---------------------|------------------------------------|---------------------------------------------------------|
+| HTF trend bull      | `http://YOUR_IP:5001/htf-trend`    | `{"coin": "SOL", "token": "...", "bias": "bull"}`       |
+| HTF trend bear      | `http://YOUR_IP:5001/htf-trend`    | `{"coin": "SOL", "token": "...", "bias": "bear"}`       |
+
+These anchor your entries to the larger trend. Enable filtering with `HTF_FILTER_ENABLED=true` in `.env` once alerts are tested.
 
 ### 5. Go live
 
@@ -426,8 +475,14 @@ Open in any browser — auto-refreshes every 30 seconds:
 http://YOUR_IP:5001/dashboard
 ```
 
-Shows equity, HL connectivity, bot armed state per coin, open positions with
-unrealized PnL, and a full log of every trade PTOS has executed.
+The dashboard shows:
+
+- **Equity** -- live USDC balance from Hyperliquid
+- **HL Status** -- connected / offline indicator
+- **HTF Filter** -- dedicated section showing the HTF bias per coin (▲ BULL / ▼ BEAR / ◆ NEUTRAL), whether the filter is active or monitoring-only, and which directions are currently blocked
+- **Bot State** -- armed signals per coin, age, and what they're waiting for
+- **Open Positions** -- size, entry price, unrealized PnL, liquidation price, margin used
+- **Bot Trade Log** -- every trade PTOS has executed including signal-triggered entries, flips, stop-triggered closes, and native stop order closes -- with fill details and timestamps. Persists across container rebuilds.
 
 ### CLI
 
@@ -452,8 +507,17 @@ active cooldowns, and current config.
 
 Every trade PTOS executes is written to `/mnt/user/appdata/ptos/data/ptos_trades.json`
 (via the volume mount in `docker-compose.yml`). This file persists across container
-rebuilds so trade history is never lost. Only trades the bot executed are logged —
-manual trades made directly on Hyperliquid are excluded.
+rebuilds so trade history is never lost.
+
+The log captures all bot-executed closes including:
+- Signal-triggered entries and exits (open long, flip to short, etc.)
+- Trailing stop closes (polling loop)
+- Stop loss from entry closes
+- Max hold time closes
+- Native HL stop order closes (detected when position disappears from the exchange)
+
+Manual trades made directly on Hyperliquid are excluded. The HTF bias state is
+persisted separately to `/mnt/user/appdata/ptos/data/ptos_htf_bias.json`.
 
 ---
 
