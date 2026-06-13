@@ -219,6 +219,19 @@ tr:hover td { background: rgba(255,255,255,0.02); }
 .badge-idle { background: rgba(139,148,158,0.08); color: var(--muted); border: 1px solid var(--border); }
 .badge-detail { color: var(--muted); font-size: 11px; }
 .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+.btn { padding: 6px 14px; border-radius: 6px; cursor: pointer; font-size: 12px; font-weight: 600; border: 1px solid; transition: opacity 0.15s; }
+.btn:hover { opacity: 0.8; }
+.btn:active { opacity: 0.6; }
+.btn-reset { background: rgba(210,153,34,0.12); border-color: var(--yellow); color: var(--yellow); }
+.btn-emergency { background: rgba(248,81,73,0.15); border-color: var(--red); color: var(--red); }
+.btn-htf { background: rgba(88,166,255,0.1); border-color: var(--blue); color: var(--blue); }
+.token-input { background: var(--surface); border: 1px solid var(--border); color: var(--text); padding: 5px 10px; border-radius: 6px; font-size: 12px; width: 160px; }
+.token-input:focus { outline: none; border-color: var(--blue); }
+.toast { position: fixed; bottom: 24px; right: 24px; background: var(--surface); border: 1px solid var(--border); color: var(--text); padding: 12px 18px; border-radius: 8px; font-size: 13px; z-index: 999; display: none; max-width: 380px; }
+.toast.show { display: block; }
+.toast.ok { border-color: var(--green); color: var(--green); }
+.toast.err { border-color: var(--red); color: var(--red); }
+.controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .dot-green { background: var(--green); box-shadow: 0 0 5px var(--green); }
 .dot-red { background: var(--red); }
 .pnl-pos { color: var(--green); }
@@ -242,6 +255,12 @@ tr:hover td { background: rgba(255,255,255,0.02); }
       <button class="refresh-btn" onclick="loadAll()">&#8635; Refresh</button>
     </div>
   </header>
+  <div class="controls" style="margin-bottom:16px;">
+    <input class="token-input" id="secret-token" type="password" placeholder="Secret token" title="Your SECRET_TOKEN from .env" />
+    <button class="btn btn-reset" onclick="doReset()">&#10003; Reset Signals</button>
+    <button class="btn btn-emergency" onclick="doEmergencyClose()">&#9888; Emergency Close</button>
+  </div>
+  <div class="toast" id="toast"></div>
 
   <div class="cards">
     <div class="card">
@@ -498,6 +517,52 @@ async function loadTrades() {
              '</tr>';
     }).join('');
   } catch(e) {}
+}
+
+function showToast(msg, ok) {
+  var t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = 'toast show ' + (ok ? 'ok' : 'err');
+  setTimeout(function() { t.className = 'toast'; }, 5000);
+}
+
+function getToken() {
+  var t = document.getElementById('secret-token').value.trim();
+  if (!t) { showToast('Enter your secret token first', false); return null; }
+  return t;
+}
+
+async function doReset() {
+  var token = getToken();
+  if (!token) return;
+  if (!confirm('Disarm all signals? Open positions and trailing stop will stay active.')) return;
+  try {
+    var r = await fetch('/reset', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json', 'X-Webhook-Secret': token},
+      body: JSON.stringify({token: token})
+    });
+    var d = await r.json();
+    if (r.ok) { showToast('Signals reset -- all disarmed', true); loadAll(); }
+    else { showToast('Reset failed: ' + (d.error || r.status), false); }
+  } catch(e) { showToast('Request failed: ' + e, false); }
+}
+
+async function doEmergencyClose() {
+  var token = getToken();
+  if (!token) return;
+  if (!confirm('EMERGENCY CLOSE -- this will close ALL open positions immediately. Are you sure?')) return;
+  if (!confirm('Are you absolutely sure? All positions will be closed at market price.')) return;
+  try {
+    var r = await fetch('/emergency-close', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json', 'X-Webhook-Secret': token},
+      body: JSON.stringify({token: token})
+    });
+    var d = await r.json();
+    if (r.ok) { showToast('Emergency close executed -- check Telegram for results', true); loadAll(); }
+    else { showToast('Emergency close failed: ' + (d.error || r.status), false); }
+  } catch(e) { showToast('Request failed: ' + e, false); }
 }
 
 async function loadAll() {
