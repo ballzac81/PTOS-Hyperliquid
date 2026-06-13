@@ -225,6 +225,9 @@ tr:hover td { background: rgba(255,255,255,0.02); }
 .btn-reset { background: rgba(210,153,34,0.12); border-color: var(--yellow); color: var(--yellow); }
 .btn-emergency { background: rgba(248,81,73,0.15); border-color: var(--red); color: var(--red); }
 .btn-htf { background: rgba(88,166,255,0.1); border-color: var(--blue); color: var(--blue); }
+.btn-arm-buy { background: rgba(63,185,80,0.12); border-color: var(--green); color: var(--green); }
+.btn-arm-sell { background: rgba(248,81,73,0.12); border-color: var(--red); color: var(--red); }
+.divider { width: 1px; height: 28px; background: var(--border); margin: 0 4px; }
 .token-input { background: var(--surface); border: 1px solid var(--border); color: var(--text); padding: 5px 10px; border-radius: 6px; font-size: 12px; width: 160px; }
 .token-input:focus { outline: none; border-color: var(--blue); }
 .toast { position: fixed; bottom: 24px; right: 24px; background: var(--surface); border: 1px solid var(--border); color: var(--text); padding: 12px 18px; border-radius: 8px; font-size: 13px; z-index: 999; display: none; max-width: 380px; }
@@ -257,6 +260,11 @@ tr:hover td { background: rgba(255,255,255,0.02); }
   </header>
   <div class="controls" style="margin-bottom:16px;">
     <input class="token-input" id="secret-token" type="password" placeholder="Secret token" title="Your SECRET_TOKEN from .env" />
+    <div class="divider"></div>
+    <input class="token-input" id="arm-coin" type="text" placeholder="Coin e.g. HYPE" style="width:110px;text-transform:uppercase;" />
+    <button class="btn btn-arm-buy" onclick="doArm('buy')">&#9650; Arm Buy</button>
+    <button class="btn btn-arm-sell" onclick="doArm('sell')">&#9660; Arm Sell</button>
+    <div class="divider"></div>
     <button class="btn btn-reset" onclick="doReset()">&#10003; Reset Signals</button>
     <button class="btn btn-emergency" onclick="doEmergencyClose()">&#9888; Emergency Close</button>
   </div>
@@ -530,6 +538,25 @@ function getToken() {
   var t = document.getElementById('secret-token').value.trim();
   if (!t) { showToast('Enter your secret token first', false); return null; }
   return t;
+}
+
+async function doArm(side) {
+  var token = getToken();
+  if (!token) return;
+  var coin = document.getElementById('arm-coin').value.trim().toUpperCase();
+  if (!coin) { showToast('Enter a coin first (e.g. HYPE)', false); return; }
+  var endpoint = side === 'buy' ? '/buy-signal' : '/sell-signal';
+  var label = side === 'buy' ? 'Buy' : 'Sell';
+  try {
+    var r = await fetch(endpoint, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json', 'X-Webhook-Secret': token},
+      body: JSON.stringify({token: token, coin: coin})
+    });
+    var d = await r.json();
+    if (r.ok) { showToast(coin + ' ' + label + ' signal armed -- waiting for trend confirmation', true); loadAll(); }
+    else { showToast('Arm failed: ' + (d.error || r.status), false); }
+  } catch(e) { showToast('Request failed: ' + e, false); }
 }
 
 async function doReset() {
