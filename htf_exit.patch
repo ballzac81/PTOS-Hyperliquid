@@ -1,0 +1,80 @@
+--- a/signal_tracker.py
++++ b/signal_tracker.py
+@@ -712,11 +712,34 @@
+         _disarm(coin, "buy")
+ 
+     def _execute_long(c=coin):
+-        if HTF_FILTER_ENABLED and htf_bias.get(c) != "bull":
+-            current = htf_bias.get(c, "not set")
+-            logger.info(f"[{c}] Long blocked by HTF filter | htf_bias={current} (need: bull)")
+-            notifier.send(f"[{c}] Long BLOCKED -- HTF bias is '{current}' (need bull)\nSet via /htf-trend to allow")
++        # HTF bull required to OPEN a long. Against-HTF: only allow closing an open short.
++        htf_ok = (not HTF_FILTER_ENABLED) or (htf_bias.get(c) == "bull")
++        if not htf_ok:
++            try:
++                positions = trader.get_positions()
++                has_short = any(p["coin"] == c and p["side"] == "short" for p in positions)
++            except Exception as e:
++                logger.error(f"[{c}] Failed to fetch positions: {e}")
++                notifier.send(f"[{c}] ❌ Could not check positions: {e}")
++                return
++            if has_short:
++                logger.info(f"[{c}] HTF not bull — closing SHORT only (no long)")
++                notifier.send(f"[{c}] HTF blocks long — closing SHORT only")
++                try:
++                    result = trader.close_short(c)
++                    if COOLDOWN_SECONDS > 0:
++                        cooldown_until[c] = time.time() + COOLDOWN_SECONDS
++                    _log_trade(c, "close_short_htf_exit", result)
++                    notifier.send(f"[{c}] ✅ Closed SHORT (HTF exit) | {result}")
++                except Exception as e:
++                    logger.error(f"[{c}] Close short failed: {e}")
++                    notifier.send(f"[{c}] ❌ Close SHORT failed: {e}")
++            else:
++                current = htf_bias.get(c, "not set")
++                logger.info(f"[{c}] Long blocked by HTF filter | htf_bias={current}")
++                notifier.send(f"[{c}] Long BLOCKED — HTF bias is '{current}' (need bull)")
+             return
++
+         if COOLDOWN_SECONDS > 0 and time.time() < cooldown_until.get(c, 0):
+             remaining = int(cooldown_until[c] - time.time())
+             logger.info(f"[{c}] Trend-up ignored -- cooldown active ({remaining}s remaining)")
+@@ -784,11 +807,34 @@
+         _disarm(coin, "sell")
+ 
+     def _execute_short(c=coin):
+-        if HTF_FILTER_ENABLED and htf_bias.get(c) != "bear":
+-            current = htf_bias.get(c, "not set")
+-            logger.info(f"[{c}] Short blocked by HTF filter | htf_bias={current} (need: bear)")
+-            notifier.send(f"[{c}] Short BLOCKED -- HTF bias is '{current}' (need bear)\nSet via /htf-trend to allow")
++        # HTF bear required to OPEN a short. Against-HTF: only allow closing an open long.
++        htf_ok = (not HTF_FILTER_ENABLED) or (htf_bias.get(c) == "bear")
++        if not htf_ok:
++            try:
++                positions = trader.get_positions()
++                has_long = any(p["coin"] == c and p["side"] == "long" for p in positions)
++            except Exception as e:
++                logger.error(f"[{c}] Failed to fetch positions: {e}")
++                notifier.send(f"[{c}] ❌ Could not check positions: {e}")
++                return
++            if has_long:
++                logger.info(f"[{c}] HTF not bear — closing LONG only (no short)")
++                notifier.send(f"[{c}] HTF blocks short — closing LONG only")
++                try:
++                    result = trader.close_long(c)
++                    if COOLDOWN_SECONDS > 0:
++                        cooldown_until[c] = time.time() + COOLDOWN_SECONDS
++                    _log_trade(c, "close_long_htf_exit", result)
++                    notifier.send(f"[{c}] ✅ Closed LONG (HTF exit) | {result}")
++                except Exception as e:
++                    logger.error(f"[{c}] Close long failed: {e}")
++                    notifier.send(f"[{c}] ❌ Close LONG failed: {e}")
++            else:
++                current = htf_bias.get(c, "not set")
++                logger.info(f"[{c}] Short blocked by HTF filter | htf_bias={current}")
++                notifier.send(f"[{c}] Short BLOCKED — HTF bias is '{current}' (need bear)")
+             return
++
+         if COOLDOWN_SECONDS > 0 and time.time() < cooldown_until.get(c, 0):
+             remaining = int(cooldown_until[c] - time.time())
+             logger.info(f"[{c}] Trend-down ignored -- cooldown active ({remaining}s remaining)")
