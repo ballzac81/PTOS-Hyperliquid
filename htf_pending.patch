@@ -1,0 +1,312 @@
+--- a/signal_tracker.py
++++ b/signal_tracker.py
+@@ -43,6 +43,10 @@
+ REARM_AFTER_STOP     = os.environ.get("REARM_AFTER_STOP", "false").lower() == "true"
+ REARM_DELAY_SECONDS  = int(os.environ.get("REARM_DELAY_SECONDS", "3600"))
+ HTF_FILTER_ENABLED   = os.environ.get("HTF_FILTER_ENABLED", "false").lower() == "true"
++# How long a blocked LTF signal may wait for HTF to flip (0 = wait forever, not recommended).
++HTF_PENDING_SECONDS  = int(os.environ.get("HTF_PENDING_SECONDS", "43200"))
++# If last HTF webhook is older than this, treat bias as neutral (0 = disabled).
++HTF_STALE_SECONDS    = int(os.environ.get("HTF_STALE_SECONDS", "129600"))
+ 
+ # -- Trade log ----------------------------------------------------------------
+ TRADE_LOG_FILE  = "/app/data/ptos_trades.json"
+@@ -83,19 +87,32 @@
+ _load_trade_log()
+ 
+ def _load_htf_bias():
+-    global htf_bias
++    global htf_bias, htf_bias_ts
+     try:
+         if os.path.exists(HTF_BIAS_FILE):
+             with open(HTF_BIAS_FILE, "r") as f:
+-                htf_bias.update(json.load(f))
++                raw = json.load(f)
++            now = time.time()
++            for coin, val in (raw or {}).items():
++                if isinstance(val, dict):
++                    htf_bias[coin] = val.get("bias", "neutral")
++                    htf_bias_ts[coin] = float(val.get("ts") or now)
++                else:
++                    # old format: {"HYPE": "bull"} — keep current bias, stamp now
++                    htf_bias[coin] = val
++                    htf_bias_ts[coin] = now
+             logging.getLogger(__name__).info(f"HTF bias loaded: {dict(htf_bias)}")
+     except Exception as e:
+         logging.getLogger(__name__).warning(f"Could not load HTF bias: {e}")
+ 
+ def _save_htf_bias():
+     try:
++        payload = {
++            coin: {"bias": htf_bias.get(coin), "ts": htf_bias_ts.get(coin, 0)}
++            for coin in set(list(htf_bias.keys()) + list(htf_bias_ts.keys()))
++        }
+         with open(HTF_BIAS_FILE, "w") as f:
+-            json.dump(htf_bias, f)
++            json.dump(payload, f)
+     except Exception as e:
+         logging.getLogger(__name__).warning(f"Could not save HTF bias: {e}")
+ 
+@@ -132,7 +149,8 @@
+ armed: dict = {}
+ COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "0"))
+ cooldown_until: dict = {}
+-htf_bias: dict = {}   # coin -> "bull" | "bear" | "neutral"
++htf_bias: dict = {}      # coin -> "bull" | "bear" | "neutral"
++htf_bias_ts: dict = {}   # coin -> unix time of last /htf-trend
+ _load_htf_bias()
+ 
+ # Start trailing stop monitor
+@@ -669,6 +687,46 @@
+     return max(0, int(WINDOW_SECONDS - (time.time() - ts)))
+ 
+ 
++def _pending_valid(coin: str, side: str) -> bool:
++    """True if the armed signal may still wait for an HTF flip."""
++    if not _is_armed(coin, side):
++        return False
++    if HTF_PENDING_SECONDS <= 0:
++        return True
++    ts = armed.get(coin, {}).get(side)
++    return ts is not None and (time.time() - ts) <= HTF_PENDING_SECONDS
++
++
++def _htf_is_stale(coin: str) -> bool:
++    if HTF_STALE_SECONDS <= 0:
++        return False
++    ts = htf_bias_ts.get(coin)
++    if not ts:
++        return True
++    return (time.time() - ts) >= HTF_STALE_SECONDS
++
++
++def _htf_allows(coin: str, side: str) -> bool:
++    """side is 'long' or 'short'. Stale bias is treated as neutral (both allowed)."""
++    if not HTF_FILTER_ENABLED:
++        return True
++    if _htf_is_stale(coin):
++        return True
++    bias = htf_bias.get(coin)
++    if side == "long":
++        return bias == "bull"
++    if side == "short":
++        return bias == "bear"
++    return False
++
++
++def _htf_label(coin: str) -> str:
++    bias = htf_bias.get(coin, "not set")
++    if _htf_is_stale(coin):
++        return f"{bias} (stale)"
++    return str(bias)
++
++
+ # -- BUY flow -----------------------------------------------------------------
+ 
+ @app.route("/buy-signal", methods=["POST"])
+@@ -709,12 +767,14 @@
+         if not _is_armed(coin, "buy"):
+             logger.info(f"[{coin}] trend-up ignored -- no active buy signal")
+             return jsonify({"status": "skip", "message": f"No active buy signal for {coin}"}), 200
+-        _disarm(coin, "buy")
+-
+-    def _execute_long(c=coin):
+-        # HTF bull required to OPEN a long. Against-HTF: only allow closing an open short.
+-        htf_ok = (not HTF_FILTER_ENABLED) or (htf_bias.get(c) == "bull")
+-        if not htf_ok:
++        htf_ok = _htf_allows(coin, "long")
++        if htf_ok:
++            _disarm(coin, "buy")
++        # else keep armed (pending) until HTF flips or pending window expires
++
++    def _execute_long(c=coin, allowed=htf_ok):
++        # Against-HTF: close an open short, keep BUY pending for the HTF flip.
++        if not allowed:
+             try:
+                 positions = trader.get_positions()
+                 has_short = any(p["coin"] == c and p["side"] == "short" for p in positions)
+@@ -722,9 +782,10 @@
+                 logger.error(f"[{c}] Failed to fetch positions: {e}")
+                 notifier.send(f"[{c}] ❌ Could not check positions: {e}")
+                 return
++            current = _htf_label(c)
+             if has_short:
+-                logger.info(f"[{c}] HTF not bull — closing SHORT only (no long)")
+-                notifier.send(f"[{c}] HTF blocks long — closing SHORT only")
++                logger.info(f"[{c}] HTF not bull — closing SHORT only, BUY stays pending")
++                notifier.send(f"[{c}] HTF blocks long — closing SHORT only\nBUY pending until HTF bull (bias={current})")
+                 try:
+                     result = trader.close_short(c)
+                     if COOLDOWN_SECONDS > 0:
+@@ -735,9 +796,8 @@
+                     logger.error(f"[{c}] Close short failed: {e}")
+                     notifier.send(f"[{c}] ❌ Close SHORT failed: {e}")
+             else:
+-                current = htf_bias.get(c, "not set")
+-                logger.info(f"[{c}] Long blocked by HTF filter | htf_bias={current}")
+-                notifier.send(f"[{c}] Long BLOCKED — HTF bias is '{current}' (need bull)")
++                logger.info(f"[{c}] Long pending — HTF bias={current} (need bull)")
++                notifier.send(f"[{c}] Long PENDING — HTF bias is '{current}' (need bull)\nStays armed until HTF flips or pending window expires")
+             return
+ 
+         if COOLDOWN_SECONDS > 0 and time.time() < cooldown_until.get(c, 0):
+@@ -810,12 +870,14 @@
+         if not _is_armed(coin, "sell"):
+             logger.info(f"[{coin}] trend-down ignored -- no active sell signal")
+             return jsonify({"status": "skip", "message": f"No active sell signal for {coin}"}), 200
+-        _disarm(coin, "sell")
+-
+-    def _execute_short(c=coin):
+-        # HTF bear required to OPEN a short. Against-HTF: only allow closing an open long.
+-        htf_ok = (not HTF_FILTER_ENABLED) or (htf_bias.get(c) == "bear")
+-        if not htf_ok:
++        htf_ok = _htf_allows(coin, "short")
++        if htf_ok:
++            _disarm(coin, "sell")
++        # else keep armed (pending) until HTF flips or pending window expires
++
++    def _execute_short(c=coin, allowed=htf_ok):
++        # Against-HTF: close an open long, keep SELL pending for the HTF flip.
++        if not allowed:
+             try:
+                 positions = trader.get_positions()
+                 has_long = any(p["coin"] == c and p["side"] == "long" for p in positions)
+@@ -823,9 +885,10 @@
+                 logger.error(f"[{c}] Failed to fetch positions: {e}")
+                 notifier.send(f"[{c}] ❌ Could not check positions: {e}")
+                 return
++            current = _htf_label(c)
+             if has_long:
+-                logger.info(f"[{c}] HTF not bear — closing LONG only (no short)")
+-                notifier.send(f"[{c}] HTF blocks short — closing LONG only")
++                logger.info(f"[{c}] HTF not bear — closing LONG only, SELL stays pending")
++                notifier.send(f"[{c}] HTF blocks short — closing LONG only\nSELL pending until HTF bear (bias={current})")
+                 try:
+                     result = trader.close_long(c)
+                     if COOLDOWN_SECONDS > 0:
+@@ -836,9 +899,8 @@
+                     logger.error(f"[{c}] Close long failed: {e}")
+                     notifier.send(f"[{c}] ❌ Close LONG failed: {e}")
+             else:
+-                current = htf_bias.get(c, "not set")
+-                logger.info(f"[{c}] Short blocked by HTF filter | htf_bias={current}")
+-                notifier.send(f"[{c}] Short BLOCKED — HTF bias is '{current}' (need bear)")
++                logger.info(f"[{c}] Short pending — HTF bias={current} (need bear)")
++                notifier.send(f"[{c}] Short PENDING — HTF bias is '{current}' (need bear)\nStays armed until HTF flips or pending window expires")
+             return
+ 
+         if COOLDOWN_SECONDS > 0 and time.time() < cooldown_until.get(c, 0):
+@@ -892,6 +954,7 @@
+ 
+     prev = htf_bias.get(coin, "not set")
+     htf_bias[coin] = bias
++    htf_bias_ts[coin] = time.time()
+     _save_htf_bias()
+     logger.info(f"[{coin}] HTF bias: {prev} -> {bias}")
+ 
+@@ -899,7 +962,96 @@
+     filter_note = " | filter ACTIVE" if HTF_FILTER_ENABLED else " | filter disabled (HTF_FILTER_ENABLED=false)"
+     notifier.send(f"[{coin}] HTF bias set: {label}{filter_note}")
+ 
+-    return jsonify({"status": "ok", "coin": coin, "htf_bias": bias, "filter_enabled": HTF_FILTER_ENABLED})
++    # Auto-fire a pending LTF signal that now matches the new bias.
++    pending_fired = None
++    with lock:
++        if bias == "bull" and _pending_valid(coin, "buy"):
++            _disarm(coin, "buy")
++            pending_fired = "long"
++        elif bias == "bear" and _pending_valid(coin, "sell"):
++            _disarm(coin, "sell")
++            pending_fired = "short"
++
++    if pending_fired == "long":
++        logger.info(f"[{coin}] HTF flipped bull — firing pending LONG")
++        notifier.send(f"[{coin}] HTF now BULL — firing pending LONG")
++        threading.Thread(target=_execute_pending_long, args=(coin,), daemon=True).start()
++    elif pending_fired == "short":
++        logger.info(f"[{coin}] HTF flipped bear — firing pending SHORT")
++        notifier.send(f"[{coin}] HTF now BEAR — firing pending SHORT")
++        threading.Thread(target=_execute_pending_short, args=(coin,), daemon=True).start()
++
++    return jsonify({
++        "status": "ok",
++        "coin": coin,
++        "htf_bias": bias,
++        "filter_enabled": HTF_FILTER_ENABLED,
++        "pending_fired": pending_fired,
++    })
++
++
++def _execute_pending_long(c: str):
++    if COOLDOWN_SECONDS > 0 and time.time() < cooldown_until.get(c, 0):
++        remaining = int(cooldown_until[c] - time.time())
++        logger.info(f"[{c}] Pending long skipped -- cooldown ({remaining}s)")
++        notifier.send(f"[{c}] Pending long skipped -- cooldown ({remaining}s)")
++        return
++    try:
++        positions = trader.get_positions()
++        has_short = any(p["coin"] == c and p["side"] == "short" for p in positions)
++        if has_short:
++            logger.info(f"[{c}] Pending LONG -- flipping SHORT to LONG")
++            notifier.send(f"[{c}] HTF bull + pending buy — flipping SHORT to LONG...")
++            result = trader.flip_to_long(c)
++            action = "flip_to_long"
++        else:
++            logger.info(f"[{c}] Pending LONG -- opening LONG")
++            notifier.send(f"[{c}] HTF bull + pending buy — opening LONG...")
++            result = trader.open_long(c)
++            action = "open_long"
++        if COOLDOWN_SECONDS > 0:
++            cooldown_until[c] = time.time() + COOLDOWN_SECONDS
++        _log_trade(c, action, result)
++        notifier.send(f"[{c}] ✅ Trade confirmed: {action} | {result}")
++    except Exception as e:
++        logger.error(f"[{c}] Pending long failed: {e}")
++        notifier.send(f"[{c}] ❌ Pending LONG FAILED: {e}")
++
++
++def _execute_pending_short(c: str):
++    if COOLDOWN_SECONDS > 0 and time.time() < cooldown_until.get(c, 0):
++        remaining = int(cooldown_until[c] - time.time())
++        logger.info(f"[{c}] Pending short skipped -- cooldown ({remaining}s)")
++        notifier.send(f"[{c}] Pending short skipped -- cooldown ({remaining}s)")
++        return
++    try:
++        if SELL_MODE == "short":
++            logger.info(f"[{c}] Pending SHORT -- flipping to SHORT")
++            notifier.send(f"[{c}] HTF bear + pending sell — flipping to SHORT...")
++            result = trader.flip_to_short(c)
++            action = "flip_to_short"
++        elif SELL_MODE == "open_short":
++            logger.info(f"[{c}] Pending SHORT -- opening SHORT")
++            notifier.send(f"[{c}] HTF bear + pending sell — opening SHORT...")
++            result = trader.open_short(c)
++            action = "open_short"
++        else:
++            pct_label = f"{int(SELL_PCT * 100)}%"
++            logger.info(f"[{c}] Pending SHORT -- closing {pct_label} of long")
++            notifier.send(f"[{c}] HTF bear + pending sell — closing {pct_label} long...")
++            result = trader.close_long(c, pct=SELL_PCT)
++            action = f"close_long_{pct_label}"
++        if COOLDOWN_SECONDS > 0:
++            cooldown_until[c] = time.time() + COOLDOWN_SECONDS
++        _log_trade(c, action, result)
++        notifier.send(f"[{c}] ✅ Trade confirmed: {action} | {result}")
++    except Exception as e:
++        logger.error(f"[{c}] Pending short failed: {e}")
++        notifier.send(f"[{c}] ❌ Pending SHORT FAILED: {e}")
+ 
+ 
+ # -- Manual overrides ---------------------------------------------------------
+@@ -1020,7 +1172,11 @@
+         "coins":               out,
+         "cooldowns":           cooldowns,
+         "htf_bias":            dict(htf_bias),
++        "htf_bias_age_s":      {c: int(time.time() - ts) for c, ts in htf_bias_ts.items() if ts},
++        "htf_stale":           {c: _htf_is_stale(c) for c in htf_bias},
+         "htf_filter_enabled":  HTF_FILTER_ENABLED,
++        "htf_pending_seconds": HTF_PENDING_SECONDS,
++        "htf_stale_seconds":   HTF_STALE_SECONDS,
+         "window_seconds":      WINDOW_SECONDS,
+         "sell_mode":           SELL_MODE,
+         "sell_pct":            SELL_PCT,
