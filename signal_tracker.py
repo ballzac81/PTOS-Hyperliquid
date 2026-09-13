@@ -43,10 +43,12 @@ SELL_PCT             = float(os.environ.get("SELL_PCT", "1.0"))
 REARM_AFTER_STOP     = os.environ.get("REARM_AFTER_STOP", "false").lower() == "true"
 REARM_DELAY_SECONDS  = int(os.environ.get("REARM_DELAY_SECONDS", "3600"))
 HTF_FILTER_ENABLED   = os.environ.get("HTF_FILTER_ENABLED", "false").lower() == "true"
+HTF_PENDING_SECONDS  = int(os.environ.get("HTF_PENDING_SECONDS", "43200"))
 
 # -- Trade log ----------------------------------------------------------------
 TRADE_LOG_FILE  = "/app/data/ptos_trades.json"
 HTF_BIAS_FILE   = "/app/data/ptos_htf_bias.json"
+ARMED_FILE      = "/app/data/ptos_armed.json"
 _trade_log: list = []
 _trade_log_lock = threading.Lock()
 
@@ -99,6 +101,48 @@ def _save_htf_bias():
     except Exception as e:
         logging.getLogger(__name__).warning(f"Could not save HTF bias: {e}")
 
+def _save_armed():
+    try:
+        os.makedirs(os.path.dirname(ARMED_FILE), exist_ok=True)
+        payload = {"armed": {c: dict(sides) for c, sides in armed.items()}, "cooldown_until": dict(cooldown_until)}
+        with open(ARMED_FILE, "w") as f:
+            json.dump(payload, f)
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"Could not save armed state: {e}")
+
+def _load_armed():
+    global armed, cooldown_until
+    try:
+        if not os.path.exists(ARMED_FILE):
+            return
+        with open(ARMED_FILE, "r") as f:
+            raw = json.load(f)
+        now = time.time()
+        loaded = raw.get("armed", {}) if isinstance(raw, dict) else {}
+        count = 0
+        for coin, sides in loaded.items():
+            if not isinstance(sides, dict):
+                continue
+            armed.setdefault(coin, {"buy": None, "sell": None})
+            for side in ("buy", "sell"):
+                ts = sides.get(side)
+                if ts is None:
+                    continue
+                ts = float(ts)
+                if WINDOW_SECONDS > 0 and now - ts > WINDOW_SECONDS:
+                    continue
+                armed[coin][side] = ts
+                count += 1
+        for coin, ts in (raw.get("cooldown_until") or {}).items():
+            ts = float(ts)
+            if ts > now:
+                cooldown_until[coin] = ts
+        logging.getLogger(__name__).info(f"Armed state loaded: {count} live signal(s)")
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"Could not load armed state: {e}")
+
+
+
 # -- Startup validation -------------------------------------------------------
 if SELL_MODE not in ("short", "close_long", "open_short"):
     print(f"ERROR: Invalid SELL_MODE '{SELL_MODE}'. Must be: short, close_long, open_short", flush=True)
@@ -134,6 +178,7 @@ COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "0"))
 cooldown_until: dict = {}
 htf_bias: dict = {}   # coin -> "bull" | "bear" | "neutral"
 _load_htf_bias()
+_load_armed()
 
 # Start trailing stop monitor
 monitor = PositionMonitor(
@@ -151,7 +196,11 @@ monitor.start()
 
 # -- SIGTERM handler ----------------------------------------------------------
 def _shutdown_handler(signum, frame):
-    notifier.send("PTOS container shutting down -- no stop monitoring until restart!")
+    try:
+        _save_armed()
+    except Exception:
+        pass
+    notifier.send("PTOS container shutting down -- armed state saved. No stop monitoring until restart!")
     sys.exit(0)
 
 signal.signal(signal.SIGTERM, _shutdown_handler)
@@ -217,6 +266,7 @@ tr:hover td { background: rgba(255,255,255,0.02); }
 .badge-buy { background: rgba(63,185,80,0.12); color: var(--green); border: 1px solid rgba(63,185,80,0.3); }
 .badge-sell { background: rgba(248,81,73,0.12); color: var(--red); border: 1px solid rgba(248,81,73,0.3); }
 .badge-idle { background: rgba(139,148,158,0.08); color: var(--muted); border: 1px solid var(--border); }
+.badge-pending { background: rgba(210,153,34,0.12); color: var(--yellow); border: 1px solid rgba(210,153,34,0.35); }
 .badge-detail { color: var(--muted); font-size: 11px; }
 .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
 .btn { padding: 6px 14px; border-radius: 6px; cursor: pointer; font-size: 12px; font-weight: 600; border: 1px solid; transition: opacity 0.15s; }
@@ -264,6 +314,13 @@ tr:hover td { background: rgba(255,255,255,0.02); }
     <input class="token-input" id="arm-coin" type="text" placeholder="Coin e.g. HYPE" style="width:110px;text-transform:uppercase;" />
     <button class="btn btn-arm-buy" onclick="doArm('buy')">&#9650; Arm Buy</button>
     <button class="btn btn-arm-sell" onclick="doArm('sell')">&#9660; Arm Sell</button>
+    <div class="divider"></div>
+    <button class="btn btn-arm-buy" onclick="doHtf('bull')">HTF Bull</button>
+    <button class="btn btn-arm-sell" onclick="doHtf('bear')">HTF Bear</button>
+    <button class="btn btn-htf" onclick="doHtf('neutral')">HTF Neutral</button>
+    <div class="divider"></div>
+    <button class="btn btn-arm-buy" onclick="doTrend('up')">Trend Up</button>
+    <button class="btn btn-arm-sell" onclick="doTrend('down')">Trend Down</button>
     <div class="divider"></div>
     <button class="btn btn-reset" onclick="doReset()">&#10003; Reset Signals</button>
     <button class="btn btn-emergency" onclick="doEmergencyClose()">&#9888; Emergency Close</button>
@@ -415,8 +472,10 @@ async function loadStatus() {
     // -- HTF Filter section --
     var filterStatusEl = document.getElementById('htf-filter-status');
     var htfEl = document.getElementById('htf-state');
+    var pendingSec = d.htf_pending_seconds || 0;
+    var pendingLbl = pendingSec > 0 ? (' · pending window ' + fmtDur(pendingSec)) : ' · pending no expiry';
     filterStatusEl.innerHTML = filterOn
-      ? '<span class="green">● ACTIVE — trades filtered by HTF bias</span>'
+      ? '<span class="green">● ACTIVE — new entries follow HTF' + pendingLbl + '</span>'
       : '<span class="muted">○ MONITORING ONLY — set HTF_FILTER_ENABLED=true to block trades</span>';
 
     var htfCoins = Object.keys(htf);
@@ -458,16 +517,35 @@ function renderHtfBadge(bias, filterOn) {
   return '<span class="badge badge-idle">◆ NEUTRAL</span>';
 }
 
+function fmtDur(sec) {
+  if (sec === null || sec === undefined) return '—';
+  sec = Math.max(0, Number(sec));
+  if (sec < 60) return sec + 's';
+  if (sec < 3600) return Math.round(sec / 60) + 'm';
+  var h = Math.floor(sec / 3600);
+  var m = Math.round((sec % 3600) / 60);
+  return h + 'h' + (m ? m + 'm' : '');
+}
 function renderBadge(state, side) {
   if (!state || state === 'idle' || state === 'expired') {
     return '<span class="badge badge-idle">' + (state || 'idle') + '</span>';
   }
   if (state.armed) {
-    var age = state.age_s < 60 ? state.age_s + 's' : Math.round(state.age_s / 60) + 'm';
+    var age = fmtDur(state.age_s);
     var waiting = state.waiting_for || (side === 'buy' ? 'trend-up' : 'trend-down');
+    if (state.htf_blocks) {
+      var left = state.pending_remaining_s;
+      var leftTxt = (left === -1 || left === undefined) ? 'no expiry' : fmtDur(left) + ' left';
+      return '<span class="badge badge-pending">● PENDING HTF</span>' +
+             '<span class="badge-detail"> need ' + (state.htf_need || '') +
+             ' · ' + leftTxt + ' · armed ' + age + '</span>';
+    }
     var cls = side === 'buy' ? 'badge-buy' : 'badge-sell';
+    var win = state.window_remaining_s;
+    var winTxt = (win === -1 || win === undefined) ? 'no expiry' : fmtDur(win) + ' left';
     return '<span class="badge ' + cls + '">● ARMED</span>' +
-           '<span class="badge-detail"> waiting for ' + waiting + ' · ' + age + ' ago</span>';
+           '<span class="badge-detail"> waiting for ' + waiting +
+           ' · ' + winTxt + ' · ' + age + ' ago</span>';
   }
   return '<span class="badge badge-idle">idle</span>';
 }
@@ -538,6 +616,42 @@ function getToken() {
   var t = document.getElementById('secret-token').value.trim();
   if (!t) { showToast('Enter your secret token first', false); return null; }
   return t;
+}
+
+async function doHtf(bias) {
+  var token = getToken();
+  if (!token) return;
+  var coin = document.getElementById('arm-coin').value.trim().toUpperCase();
+  if (!coin) { showToast('Enter a coin first (e.g. HYPE)', false); return; }
+  try {
+    var r = await fetch('/htf-trend', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json', 'X-Webhook-Secret': token},
+      body: JSON.stringify({token: token, coin: coin, bias: bias})
+    });
+    var d = await r.json();
+    if (r.ok) { showToast(coin + ' HTF set to ' + bias.toUpperCase(), true); loadAll(); }
+    else { showToast('HTF set failed: ' + (d.error || r.status), false); }
+  } catch(e) { showToast('Request failed: ' + e, false); }
+}
+
+async function doTrend(dir) {
+  var token = getToken();
+  if (!token) return;
+  var coin = document.getElementById('arm-coin').value.trim().toUpperCase();
+  if (!coin) { showToast('Enter a coin first (e.g. HYPE)', false); return; }
+  var endpoint = dir === 'up' ? '/trend-up' : '/trend-down';
+  if (!confirm('Fire ' + endpoint + ' for ' + coin + '? This can execute a trade.')) return;
+  try {
+    var r = await fetch(endpoint, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json', 'X-Webhook-Secret': token},
+      body: JSON.stringify({token: token, coin: coin})
+    });
+    var d = await r.json();
+    if (r.ok) { showToast(coin + ' ' + endpoint + ' sent — watch Telegram', true); loadAll(); }
+    else { showToast('Trend failed: ' + (d.error || r.status), false); }
+  } catch(e) { showToast('Request failed: ' + e, false); }
 }
 
 async function doArm(side) {
@@ -652,12 +766,14 @@ def _arm(coin: str, side: str) -> bool:
         armed[coin] = {"buy": None, "sell": None}
     was_armed = _is_armed(coin, side)
     armed[coin][side] = time.time()
+    _save_armed()
     return was_armed
 
 
 def _disarm(coin: str, side: str):
     if coin in armed:
         armed[coin][side] = None
+        _save_armed()
 
 
 def _window_remaining(coin: str, side: str) -> int:
@@ -709,14 +825,37 @@ def trend_up():
         if not _is_armed(coin, "buy"):
             logger.info(f"[{coin}] trend-up ignored -- no active buy signal")
             return jsonify({"status": "skip", "message": f"No active buy signal for {coin}"}), 200
-        _disarm(coin, "buy")
+        htf_ok = (not HTF_FILTER_ENABLED) or (htf_bias.get(coin) == "bull")
+        if htf_ok:
+            _disarm(coin, "buy")
 
-    def _execute_long(c=coin):
-        if HTF_FILTER_ENABLED and htf_bias.get(c) != "bull":
-            current = htf_bias.get(c, "not set")
-            logger.info(f"[{c}] Long blocked by HTF filter | htf_bias={current} (need: bull)")
-            notifier.send(f"[{c}] Long BLOCKED -- HTF bias is '{current}' (need bull)\nSet via /htf-trend to allow")
+    def _execute_long(c=coin, allowed=htf_ok):
+        if not allowed:
+            try:
+                positions = trader.get_positions()
+                has_short = any(p["coin"] == c and p["side"] == "short" for p in positions)
+            except Exception as e:
+                logger.error(f"[{c}] Failed to fetch positions: {e}")
+                notifier.send(f"[{c}] ❌ Could not check positions: {e}")
+                return
+            if has_short:
+                logger.info(f"[{c}] HTF not bull — closing SHORT only (no long)")
+                notifier.send(f"[{c}] HTF blocks long — closing SHORT only")
+                try:
+                    result = trader.close_short(c)
+                    if COOLDOWN_SECONDS > 0:
+                        cooldown_until[c] = time.time() + COOLDOWN_SECONDS
+                    _log_trade(c, "close_short_htf_exit", result)
+                    notifier.send(f"[{c}] ✅ Closed SHORT (HTF exit) | {result}")
+                except Exception as e:
+                    logger.error(f"[{c}] Close short failed: {e}")
+                    notifier.send(f"[{c}] ❌ Close SHORT failed: {e}")
+            else:
+                current = htf_bias.get(c, "not set")
+                logger.info(f"[{c}] Long blocked by HTF filter | htf_bias={current}")
+                notifier.send(f"[{c}] Long BLOCKED — HTF bias is '{current}' (need bull)")
             return
+
         if COOLDOWN_SECONDS > 0 and time.time() < cooldown_until.get(c, 0):
             remaining = int(cooldown_until[c] - time.time())
             logger.info(f"[{c}] Trend-up ignored -- cooldown active ({remaining}s remaining)")
@@ -787,14 +926,37 @@ def trend_down():
         if not _is_armed(coin, "sell"):
             logger.info(f"[{coin}] trend-down ignored -- no active sell signal")
             return jsonify({"status": "skip", "message": f"No active sell signal for {coin}"}), 200
-        _disarm(coin, "sell")
+        htf_ok = (not HTF_FILTER_ENABLED) or (htf_bias.get(coin) == "bear")
+        if htf_ok:
+            _disarm(coin, "sell")
 
-    def _execute_short(c=coin):
-        if HTF_FILTER_ENABLED and htf_bias.get(c) != "bear":
-            current = htf_bias.get(c, "not set")
-            logger.info(f"[{c}] Short blocked by HTF filter | htf_bias={current} (need: bear)")
-            notifier.send(f"[{c}] Short BLOCKED -- HTF bias is '{current}' (need bear)\nSet via /htf-trend to allow")
+    def _execute_short(c=coin, allowed=htf_ok):
+        if not allowed:
+            try:
+                positions = trader.get_positions()
+                has_long = any(p["coin"] == c and p["side"] == "long" for p in positions)
+            except Exception as e:
+                logger.error(f"[{c}] Failed to fetch positions: {e}")
+                notifier.send(f"[{c}] ❌ Could not check positions: {e}")
+                return
+            if has_long:
+                logger.info(f"[{c}] HTF not bear — closing LONG only (no short)")
+                notifier.send(f"[{c}] HTF blocks short — closing LONG only")
+                try:
+                    result = trader.close_long(c)
+                    if COOLDOWN_SECONDS > 0:
+                        cooldown_until[c] = time.time() + COOLDOWN_SECONDS
+                    _log_trade(c, "close_long_htf_exit", result)
+                    notifier.send(f"[{c}] ✅ Closed LONG (HTF exit) | {result}")
+                except Exception as e:
+                    logger.error(f"[{c}] Close long failed: {e}")
+                    notifier.send(f"[{c}] ❌ Close LONG failed: {e}")
+            else:
+                current = htf_bias.get(c, "not set")
+                logger.info(f"[{c}] Short blocked by HTF filter | htf_bias={current}")
+                notifier.send(f"[{c}] Short BLOCKED — HTF bias is '{current}' (need bear)")
             return
+
         if COOLDOWN_SECONDS > 0 and time.time() < cooldown_until.get(c, 0):
             remaining = int(cooldown_until[c] - time.time())
             logger.info(f"[{c}] Trend-down ignored -- cooldown active ({remaining}s remaining)")
@@ -958,11 +1120,20 @@ def status():
                     coin_status[side] = "expired"
                 else:
                     age = int(now - ts)
+                    need = "bull" if side == "buy" else "bear"
+                    bias = htf_bias.get(coin)
+                    htf_blocks = bool(HTF_FILTER_ENABLED and bias != need)
+                    pending_left = -1
+                    if htf_blocks and HTF_PENDING_SECONDS > 0:
+                        pending_left = max(0, HTF_PENDING_SECONDS - age)
                     coin_status[side] = {
-                        "armed":              True,
-                        "age_s":              age,
-                        "window_remaining_s": -1 if WINDOW_SECONDS == 0 else max(0, WINDOW_SECONDS - age),
-                        "waiting_for":        "trend-up" if side == "buy" else "trend-down",
+                        "armed":               True,
+                        "age_s":               age,
+                        "window_remaining_s":  -1 if WINDOW_SECONDS == 0 else max(0, WINDOW_SECONDS - age),
+                        "waiting_for":         "trend-up" if side == "buy" else "trend-down",
+                        "htf_blocks":          htf_blocks,
+                        "htf_need":            need,
+                        "pending_remaining_s": pending_left,
                     }
             out[coin] = coin_status
     cooldowns = {
@@ -975,6 +1146,7 @@ def status():
         "cooldowns":           cooldowns,
         "htf_bias":            dict(htf_bias),
         "htf_filter_enabled":  HTF_FILTER_ENABLED,
+        "htf_pending_seconds": HTF_PENDING_SECONDS,
         "window_seconds":      WINDOW_SECONDS,
         "sell_mode":           SELL_MODE,
         "sell_pct":            SELL_PCT,
