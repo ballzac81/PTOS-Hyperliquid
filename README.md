@@ -23,7 +23,8 @@ false entries.
 - **Async trade execution** -- webhooks return 202 immediately; trade executes in background with Telegram confirmation
 - **Native stop notification** -- Telegram alert fires even when the HL native stop order closes the position before the polling loop runs; includes entry price, close price, and PnL%
 - **Full trade log** -- all closes (signal-triggered and stop-triggered) appear in the dashboard trade log
-- **HTF bias filter** -- anchor every trade to a higher timeframe trend; longs blocked unless HTF is bull, shorts blocked unless HTF is bear; bias persists across restarts
+- **HTF bias filter** -- new entries follow HTF bias; against-bias LTF still closes; blocked signals stay pending
+- **Armed state persist** -- arms saved to ptos_armed.json across restarts
 - **Cooldown after close** -- prevents whipsaw re-entries after a stop or exit
 - **Position size safety cap** -- hard ceiling on notional exposure per trade
 - **SELL_MODE toggle** -- flip to short, exit to USDC, or open short alongside long -- your choice
@@ -241,37 +242,12 @@ Trailing stop fires → long closed
 
 ### HTF bias filter
 
-| Setting              | Default | Description                                                        |
-|----------------------|---------|--------------------------------------------------------------------|
-| `HTF_FILTER_ENABLED` | `false` | `true` = block trades that don't match the HTF bias               |
+See `docs/HTF.md` for the live behaviour (pending, close-only against HTF, dashboard buttons, persist).
 
-When enabled, the bot checks the stored HTF bias for a coin before executing:
-- Longs are blocked unless `htf_bias[coin] == "bull"`
-- Shorts are blocked unless `htf_bias[coin] == "bear"`
-- If no bias has been set for a coin, all trades for that coin are blocked
-
-If a trade is blocked, a Telegram message explains why and the signal is discarded.
-
-**Setting the bias** -- POST to `/htf-trend` from a TradingView alert on a higher timeframe chart:
-
-```json
-{"coin": "HYPE", "token": "YOUR_SECRET_TOKEN", "bias": "bull"}
-```
-
-Valid values for `bias`: `bull` | `bear` | `neutral`
-
-The bias is **persisted to disk** (`/app/data/ptos_htf_bias.json`) and survives container restarts. Set it once and it stays until you update it.
-
-**Typical TradingView setup:** create two alerts on your daily/weekly chart (e.g. your optimised trend indicator, or a 200 EMA cross). One fires when the trend turns bullish, one when it turns bearish.
-
-| Alert               | Webhook URL          | Body                                                              |
-|---------------------|----------------------|-------------------------------------------------------------------|
-| HTF turns bullish   | `/htf-trend`         | `{"coin": "HYPE", "token": "...", "bias": "bull"}`               |
-| HTF turns bearish   | `/htf-trend`         | `{"coin": "HYPE", "token": "...", "bias": "bear"}`               |
-
-The dashboard shows a dedicated **HTF Filter** section with the current bias per coin and whether the filter is active or in monitoring-only mode.
-
-> **Leave `HTF_FILTER_ENABLED=false`** while testing to see the bias displayed on the dashboard without it blocking any trades.
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `HTF_FILTER_ENABLED` | `false` | Gate new entries by HTF bias |
+| `HTF_PENDING_SECONDS` | `43200` | Pending window for a blocked LTF signal |
 
 ### Cooldown & safety
 
