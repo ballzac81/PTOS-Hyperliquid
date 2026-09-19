@@ -413,6 +413,16 @@ function fmtPnl(n) {
   return '<span class="' + cls + '">' + sign + '$' + fmt(Math.abs(v)) + '</span>';
 }
 
+function fmtPnlPct(pnl, base) {
+  var v = Number(pnl);
+  var b = Number(base);
+  if (isNaN(v) || isNaN(b) || b === 0) return '';
+  var pct = v / b * 100;
+  var sign = pct > 0 ? '+' : '';
+  var cls = pct > 0 ? 'pnl-pos' : (pct < 0 ? 'pnl-neg' : 'pnl-zero');
+  return ' <span class="' + cls + '">(' + sign + pct.toFixed(2) + '%)</span>';
+}
+
 function fmtTime(ms) {
   var d = new Date(ms);
   var dd = String(d.getDate()).padStart(2,'0');
@@ -558,7 +568,7 @@ async function loadPositions() {
     document.getElementById('pos-count').textContent = positions.length;
     var totalUpnl = positions.reduce(function(s, p) { return s + (p.unrealized_pnl || 0); }, 0);
     var upnlEl = document.getElementById('unrealized-pnl');
-    upnlEl.innerHTML = fmtPnl(totalUpnl);
+    upnlEl.innerHTML = fmtPnl(totalUpnl) + fmtPnlPct(totalUpnl, parseFloat(String(document.getElementById('equity').textContent||'').replace(/[^0-9.-]/g,'')));
     upnlEl.className = 'card-value';
     var tbody = document.getElementById('positions-body');
     if (positions.length === 0) {
@@ -572,7 +582,7 @@ async function loadPositions() {
              '<td class="' + sideCls + '">' + p.side.toUpperCase() + '</td>' +
              '<td>' + fmt(p.size, 4) + '</td>' +
              '<td>' + fmtUsd(p.entry_price) + '</td>' +
-             '<td>' + fmtPnl(p.unrealized_pnl) + '</td>' +
+             '<td>' + fmtPnl(p.unrealized_pnl) + fmtPnlPct(p.unrealized_pnl, p.margin_used) + '</td>' +
              '<td>' + liq + '</td>' +
              '<td>' + fmtUsd(p.margin_used) + '</td></tr>';
     }).join('');
